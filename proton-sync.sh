@@ -5,34 +5,92 @@ set -euo pipefail
 # CONFIGURATION
 # ============================================================
 
-LOCAL_DIR="$HOME/Proton Drive/root"
+LOCAL_DIR="$HOME/Proton Drive/root-test"
 REMOTE_DIR="/my-files"
 STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/proton-sync"
 SNAPSHOT="$STATE_DIR/snapshot"
 
-# Global temp/state files
 KNOWN_REMOTE_DIRS="$STATE_DIR/known_remote_dirs"
 LOCAL_MANIFEST="$STATE_DIR/local_manifest"
 REMOTE_MANIFEST="$STATE_DIR/remote_manifest"
 NEW_SNAPSHOT="$STATE_DIR/snapshot.new"
+LOCK_FILE="$STATE_DIR/sync.lock"
+LOCAL_TRASH="$STATE_DIR/trash/$(date +%Y%m%d-%H%M%S)"
+TRASH_RETENTION_DAYS=30
+
+# Files/folders that never sync (shell glob patterns, matched
+# against every path component)
+EXCLUDE_PATTERNS=(
+    "*.tmp"
+    "*.swp"
+    "*.partial"
+    ".DS_Store"
+    "Thumbs.db"
+    ".git"
+    ".proton-sync"
+)
 
 mkdir -p "$STATE_DIR"
 touch "$SNAPSHOT"
-> "$KNOWN_REMOTE_DIRS"
-
-# In-memory maps
-declare -A SNAPSHOT_LOCAL_FP
-declare -A SNAPSHOT_REMOTE_FP
-declare -A SNAPSHOT_SEEN
-declare -A LOCAL_ITEMS
-declare -A REMOTE_ITEMS
-declare -A KNOWN_DIRS
 
 # ============================================================
-# DEBUG
+# MODES
 # ============================================================
 
 DEBUG="${PROTON_SYNC_DEBUG:-false}"
+DRY_RUN="${PROTON_SYNC_DRY_RUN:-false}"
+
+# ============================================================
+# IN-MEMORY STATE
+# ============================================================
+
+declare -A SNAPSHOT_LOCAL_FP    # rel -> "size|mtime" at last sync (local)
+declare -A SNAPSHOT_REMOTE_FP   # rel -> "size|mtime" at last sync (remote)
+declare -A SNAPSHOT_SEEN        # rel -> 1 if in snapshot
+declare -A LOCAL_ITEMS          # "type|rel" -> 1
+declare -A REMOTE_ITEMS         # "type|rel" -> "size|mtime" (files) or "" (folders)
+declare -A KNOWN_DIRS           # rel -> 1 for known remote dirs ("/" = root)
+
+# Deferred action queues (for move detection)
+declare -a NEW_LOCAL_FILES=()         # local-only, never synced -> upload?
+declare -a NEW_REMOTE_FILES=()        # remote-only, never synced -> download?
+declare -a DELETED_REMOTELY_FILES=()  # local-only, was synced -> delete local?
+declare -a TRASH_REMOTE_FILES=()      # remote-only, was synced -> trash remote?
+declare -a DEL_LOCAL_FOLDERS=()       # local folder, deleted remotely
+declare -a TRASH_REMOTE_FOLDERS=()    # remote folder, deleted locally
+
+declare -A NEW_LOCAL_FP=()            # rel -> current local fp
+declare -A NEW_REMOTE_FP=()           # rel -> current remote fp
+
+# Counters
+COUNT_OK=0
+COUNT_UPLOADED=0
+COUNT_DOWNLOADED=0
+COUNT_MOVED_REMOTE=0
+COUNT_MOVED_LOCAL=0
+COUNT_DELETED_LOCAL=0
+COUNT_TRASHED_REMOTE=0
+COUNT_CONFLICTS=0
+COUNT_ERRORS=0
+COUNT_FIRST_SYNC=0
+
+# ============================================================
+# LOCKING
+# ============================================================
+
+acquire_lock() {
+    if ! mkdir "$LOCK_FILE" 2>/dev/null; then
+        echo "ERROR: Another sync is already running (lock: $LOCK_FILE)"
+        echo "If you are sure no sync is running, remove it manually:"
+        echo "  rmdir '$LOCK_FILE'"
+        exit 1
+    fi
+    trap 'rm -rf "$LOCK_FILE"' EXIT
+}
+
+# ============================================================
+# DEBUG / EXECUTION HELPERS
+# ============================================================
 
 debug() {
     if [ "$DEBUG" = true ]; then
@@ -48,18 +106,104 @@ debug_file() {
     fi
 }
 
-# ============================================================
-# TIMESTAMP / FINGERPRINT FUNCTIONS
-# ============================================================
+# Run a command, or just print it in dry-run mode
+run() {
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY RUN] $*"
+        return 0
+    fi
+    "$@"
+}
 
-get_local_fingerprint() {
-    local file="$1"
-    # Single stat call for both size and mtime
-    stat -c '%s|%Y' "$file"
+# Retry a command with exponential backoff
+retry() {
+    local attempts=3
+    local delay=5
+    local i
+    for ((i = 1; i <= attempts; i++)); do
+        if "$@"; then
+            return 0
+        fi
+        if [ "$i" -lt "$attempts" ]; then
+            echo "[RETRY $i/$attempts] Failed, waiting ${delay}s: $*"
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+    done
+    echo "[ERROR] Giving up after $attempts attempts: $*"
+    return 1
+}
+
+# Run with retry, or print in dry-run mode
+run_retry() {
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY RUN] $*"
+        return 0
+    fi
+    retry "$@"
 }
 
 # ============================================================
-# REMOTE LISTING (RECURSIVE) — now includes size+mtime
+# EXCLUDE PATTERNS
+# ============================================================
+
+is_excluded() {
+    local rel="$1"
+    local part pattern
+    local -a parts
+    IFS='/' read -ra parts <<< "$rel"
+    for part in "${parts[@]}"; do
+        for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+            case "$part" in
+                $pattern) return 0 ;;
+            esac
+        done
+    done
+    return 1
+}
+
+# ============================================================
+# LOCAL TRASH (recoverable deletions)
+# ============================================================
+
+trash_local() {
+    local local_path="$1"
+    local rel="$2"
+
+    if [ ! -e "$local_path" ]; then
+        return 0
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY RUN] trash_local $local_path"
+        return 0
+    fi
+
+    mkdir -p "$LOCAL_TRASH/$(dirname "$rel")"
+    mv "$local_path" "$LOCAL_TRASH/$rel"
+    echo "  (recoverable in $LOCAL_TRASH/$rel)"
+}
+
+cleanup_old_trash() {
+    if [ "$DRY_RUN" = true ]; then
+        return 0
+    fi
+    if [ -d "$STATE_DIR/trash" ]; then
+        find "$STATE_DIR/trash" -mindepth 1 -maxdepth 1 -type d \
+            -mtime +"$TRASH_RETENTION_DAYS" -exec rm -rf {} + 2>/dev/null || true
+    fi
+}
+
+# ============================================================
+# FINGERPRINT FUNCTIONS
+# ============================================================
+
+get_local_fingerprint() {
+    stat -c '%s|%Y' "$1"
+}
+
+# ============================================================
+# REMOTE LISTING (RECURSIVE)
 # ============================================================
 
 list_remote_recursive() {
@@ -84,6 +228,11 @@ list_remote_recursive() {
                 rel_path="$prefix/$name"
             fi
 
+            if is_excluded "$rel_path"; then
+                debug "Excluded remote: $rel_path"
+                continue
+            fi
+
             if [ "$type" = "folder" ]; then
                 echo "folder|$rel_path||"
                 list_remote_recursive "$remote_path/$name" "$rel_path"
@@ -101,13 +250,29 @@ list_remote_recursive() {
         done
 }
 
+# Fetch remote fingerprint for one path (used after uploads)
+fetch_remote_fingerprint() {
+    local remote_path="$1"
+    local info rsize rmtime rmtime_epoch
+    info=$(proton-drive filesystem info "$remote_path" -j 2>/dev/null) || true
+    if [ -z "$info" ]; then
+        echo ""
+        return
+    fi
+    rsize=$(echo "$info" | jq -r '.activeRevision.value.claimedSize // 0')
+    rmtime=$(echo "$info" | jq -r '.activeRevision.value.claimedModificationTime // ""')
+    rmtime_epoch=0
+    [ -n "$rmtime" ] && rmtime_epoch=$(date -d "$rmtime" +%s 2>/dev/null || echo 0)
+    echo "${rsize}|${rmtime_epoch}"
+}
+
 # ============================================================
-# DIRECTORY MANAGEMENT (in-memory cache)
+# DIRECTORY MANAGEMENT
 # ============================================================
 
 build_remote_dir_cache() {
     KNOWN_DIRS=()
-    KNOWN_DIRS["/"]=1        # Use "/" to represent root instead of ""
+    KNOWN_DIRS["/"]=1
     while IFS='|' read -r type rel _rest; do
         if [ "$type" = "folder" ]; then
             KNOWN_DIRS["$rel"]=1
@@ -135,7 +300,7 @@ create_remote_folder() {
     fi
 
     echo "[CREATE REMOTE FOLDER] $full_parent/$folder_name"
-    proton-drive filesystem create-folder "$full_parent" "$folder_name"
+    run_retry proton-drive filesystem create-folder "$full_parent" "$folder_name"
 
     if [ -z "$parent_rel" ]; then
         KNOWN_DIRS["$folder_name"]=1
@@ -177,7 +342,7 @@ ensure_local_folders() {
     local local_path="$1"
     if [ ! -d "$local_path" ]; then
         echo "[CREATE LOCAL FOLDER] $local_path"
-        mkdir -p "$local_path"
+        run mkdir -p "$local_path"
     fi
 }
 
@@ -186,7 +351,7 @@ ensure_local_folders() {
 # ============================================================
 
 load_snapshot() {
-    [ -f "$SNAPSHOT" ] || return
+    [ -f "$SNAPSHOT" ] || return 0
     while IFS='|' read -r type rel f3 f4 f5 f6; do
         [ -z "$type" ] && continue
         SNAPSHOT_SEEN["$rel"]=1
@@ -216,6 +381,70 @@ was_previously_synced() {
 }
 
 # ============================================================
+# SAFETY CHECKS
+# ============================================================
+
+check_auth() {
+    if ! proton-drive filesystem list "$REMOTE_DIR" -j >/dev/null 2>&1; then
+        echo "ERROR: Cannot access $REMOTE_DIR — are you logged in?"
+        echo "Run: proton-drive auth login"
+        exit 1
+    fi
+}
+
+check_remote_manifest_sane() {
+    if [ ! -s "$REMOTE_MANIFEST" ] && [ -s "$SNAPSHOT" ]; then
+        echo "ERROR: Remote listing came back empty but sync history exists."
+        echo "Refusing to proceed — this would delete all local files."
+        echo "If the remote really is empty, remove the snapshot to reset:"
+        echo "  rm '$SNAPSHOT'"
+        exit 1
+    fi
+}
+
+# ============================================================
+# MOVE EXECUTION
+# ============================================================
+
+# A file moved locally from old_rel -> new_rel.
+# Mirror that move on the remote instead of trash + re-upload.
+do_remote_move() {
+    local old_rel="$1"
+    local new_rel="$2"
+
+    local old_parent new_parent
+    old_parent=$(dirname "$old_rel")
+    new_parent=$(dirname "$new_rel")
+    [ "$old_parent" = "." ] && old_parent=""
+    [ "$new_parent" = "." ] && new_parent=""
+
+    local old_base new_base
+    old_base=$(basename "$old_rel")
+    new_base=$(basename "$new_rel")
+
+    local target_parent_path
+    if [ -z "$new_parent" ]; then
+        target_parent_path="$REMOTE_DIR"
+    else
+        target_parent_path="$REMOTE_DIR/$new_parent"
+    fi
+
+    ensure_remote_folders "$new_parent"
+
+    if [ "$old_parent" != "$new_parent" ]; then
+        run_retry proton-drive filesystem move \
+            "$REMOTE_DIR/$old_rel" "$target_parent_path" || return 1
+    fi
+
+    if [ "$old_base" != "$new_base" ]; then
+        run_retry proton-drive filesystem rename \
+            "$target_parent_path/$old_base" "$new_base" || return 1
+    fi
+
+    return 0
+}
+
+# ============================================================
 # MAIN SYNC
 # ============================================================
 
@@ -227,9 +456,12 @@ sync() {
     # --------------------------------------------------------
     echo "=== Building local manifest ==="
     > "$LOCAL_MANIFEST"
-    find "$LOCAL_DIR" -mindepth 1 -not -path "*/.proton-sync/*" | sort | \
+    find "$LOCAL_DIR" -mindepth 1 | sort | \
         while read -r path; do
             rel="${path#$LOCAL_DIR/}"
+            if is_excluded "$rel"; then
+                continue
+            fi
             if [ -d "$path" ]; then
                 echo "folder|$rel" >> "$LOCAL_MANIFEST"
             else
@@ -241,7 +473,8 @@ sync() {
     > "$REMOTE_MANIFEST"
     list_remote_recursive "$REMOTE_DIR" "" | sort > "$REMOTE_MANIFEST"
 
-    # Load everything into memory
+    check_remote_manifest_sane
+
     load_snapshot
     load_manifests_to_memory
     build_remote_dir_cache
@@ -250,27 +483,25 @@ sync() {
     debug_file "Remote manifest" "$REMOTE_MANIFEST"
 
     # --------------------------------------------------------
-    # PHASE 2: Process local items
+    # PHASE 2: Scan local items
     # --------------------------------------------------------
     echo ""
     echo "=== Processing local items ==="
-    while IFS='|' read -r type rel _size _mtime; do
+    while IFS='|' read -r type rel; do
         remote_path="$REMOTE_DIR/$rel"
         local_path="$LOCAL_DIR/$rel"
 
         if [ "$type" = "folder" ]; then
-            if [ -z "${REMOTE_ITEMS[folder|${rel}]+x}" ]; then
-                if was_previously_synced "$rel"; then
-                    echo "[DELETED REMOTELY] folder: $rel → removing local"
-                    rm -rf "$local_path"
-                    continue
-                else
-                    ensure_remote_folders "$rel"
-                fi
-            else
+            if [ -n "${REMOTE_ITEMS[folder|${rel}]+x}" ]; then
                 echo "[OK] folder: $rel"
+                echo "folder|${rel}|" >> "$NEW_SNAPSHOT"
+            elif was_previously_synced "$rel"; then
+                # Deleted remotely — defer until after move detection
+                DEL_LOCAL_FOLDERS+=("$rel")
+            else
+                ensure_remote_folders "$rel"
+                echo "folder|${rel}|" >> "$NEW_SNAPSHOT"
             fi
-            echo "folder|${rel}|" >> "$NEW_SNAPSHOT"
 
         elif [ "$type" = "file" ]; then
             if [ ! -f "$local_path" ]; then
@@ -281,11 +512,10 @@ sync() {
             local_fp=$(get_local_fingerprint "$local_path")
             local prev_local_fp="${SNAPSHOT_LOCAL_FP[$rel]:-}"
             local prev_remote_fp="${SNAPSHOT_REMOTE_FP[$rel]:-}"
-            local remote_fp=""
 
             if [ -n "${REMOTE_ITEMS[file|${rel}]+x}" ]; then
-                # File exists on both sides — fingerprint already in manifest
-                remote_fp="${REMOTE_ITEMS[file|${rel}]}"
+                # --- File exists on both sides ---
+                local remote_fp="${REMOTE_ITEMS[file|${rel}]}"
 
                 local local_changed=false
                 local remote_changed=false
@@ -300,85 +530,92 @@ sync() {
                 debug "$rel: local_fp=$local_fp prev=$prev_local_fp changed=$local_changed"
                 debug "$rel: remote_fp=$remote_fp prev=$prev_remote_fp changed=$remote_changed"
 
-                if [ -n "$prev_local_fp" ] && [ -n "$prev_remote_fp" ]; then
-                    if [ "$local_changed" = false ] && [ "$remote_changed" = false ]; then
-                        echo "[OK] $rel"
-
-                    elif [ "$local_changed" = true ] && [ "$remote_changed" = false ]; then
-                        echo "[UPLOAD MODIFIED] $rel (changed locally)"
-                        local parent
-                        parent=$(dirname "$remote_path")
-                        proton-drive filesystem upload -f replace "$local_path" "$parent"
-                        # Refresh fingerprints
-                        local info
-                        info=$(proton-drive filesystem info "$remote_path" -j 2>/dev/null)
-                        local rsize rmtime
-                        rsize=$(echo "$info" | jq -r '.activeRevision.value.claimedSize // 0')
-                        rmtime=$(echo "$info" | jq -r '.activeRevision.value.claimedModificationTime // ""')
-                        local rmtime_epoch=0
-                        [ -n "$rmtime" ] && rmtime_epoch=$(date -d "$rmtime" +%s 2>/dev/null || echo 0)
-                        remote_fp="${rsize}|${rmtime_epoch}"
-                        local_fp=$(get_local_fingerprint "$local_path")
-
-                    elif [ "$local_changed" = false ] && [ "$remote_changed" = true ]; then
-                        echo "[DOWNLOAD MODIFIED] $rel (changed remotely)"
-                        local local_parent
-                        local_parent=$(dirname "$local_path")
-                        ensure_local_folders "$local_parent"
-                        proton-drive filesystem download -f replace "$remote_path" "$local_parent"
-                        local_fp=$(get_local_fingerprint "$local_path")
-
-                    else
-                        echo "[CONFLICT] $rel — changed on BOTH sides!"
-                        echo "  Local FP:       $local_fp"
-                        echo "  Prev Local FP:  $prev_local_fp"
-                        echo "  Remote FP:      $remote_fp"
-                        echo "  Prev Remote FP: $prev_remote_fp"
-                        local local_parent base ext
-                        local_parent=$(dirname "$local_path")
-                        base="${rel%.*}"
-                        ext="${rel##*.}"
-                        echo "  Saving remote as ${base}.remote.${ext}"
-                        proton-drive filesystem download "$remote_path" "$local_parent"
-                        mv "$local_parent/$(basename "$rel")" \
-                           "$local_parent/$(basename "${base}.remote.${ext}")" 2>/dev/null || true
-                    fi
-                else
+                if [ -z "$prev_local_fp" ] || [ -z "$prev_remote_fp" ]; then
                     echo "[FIRST SYNC] $rel — recording state"
+                    COUNT_FIRST_SYNC=$((COUNT_FIRST_SYNC + 1))
+                    echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+
+                elif [ "$local_changed" = false ] && [ "$remote_changed" = false ]; then
+                    echo "[OK] $rel"
+                    COUNT_OK=$((COUNT_OK + 1))
+                    echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+
+                elif [ "$local_changed" = true ] && [ "$remote_changed" = false ]; then
+                    echo "[UPLOAD MODIFIED] $rel (changed locally)"
+                    local parent
+                    parent=$(dirname "$remote_path")
+                    if run_retry proton-drive filesystem upload -f replace \
+                        "$local_path" "$parent"; then
+                        COUNT_UPLOADED=$((COUNT_UPLOADED + 1))
+                        if [ "$DRY_RUN" = false ]; then
+                            remote_fp=$(fetch_remote_fingerprint "$remote_path")
+                            local_fp=$(get_local_fingerprint "$local_path")
+                        fi
+                        echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+                    else
+                        COUNT_ERRORS=$((COUNT_ERRORS + 1))
+                        echo "[SKIP] Will retry next sync: $rel"
+                        # Keep old state so it retries next run
+                        echo "file|${rel}|${prev_local_fp}|${prev_remote_fp}" >> "$NEW_SNAPSHOT"
+                    fi
+
+                elif [ "$local_changed" = false ] && [ "$remote_changed" = true ]; then
+                    echo "[DOWNLOAD MODIFIED] $rel (changed remotely)"
+                    local local_parent
+                    local_parent=$(dirname "$local_path")
+                    ensure_local_folders "$local_parent"
+                    if run_retry proton-drive filesystem download -f replace \
+                        "$remote_path" "$local_parent"; then
+                        COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
+                        if [ "$DRY_RUN" = false ]; then
+                            local_fp=$(get_local_fingerprint "$local_path")
+                        fi
+                        echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+                    else
+                        COUNT_ERRORS=$((COUNT_ERRORS + 1))
+                        echo "[SKIP] Will retry next sync: $rel"
+                        echo "file|${rel}|${prev_local_fp}|${prev_remote_fp}" >> "$NEW_SNAPSHOT"
+                    fi
+
+                else
+                    echo "[CONFLICT] $rel — changed on BOTH sides!"
+                    echo "  Local FP:       $local_fp"
+                    echo "  Prev Local FP:  $prev_local_fp"
+                    echo "  Remote FP:      $remote_fp"
+                    echo "  Prev Remote FP: $prev_remote_fp"
+                    COUNT_CONFLICTS=$((COUNT_CONFLICTS + 1))
+                    local local_parent base ext
+                    local_parent=$(dirname "$local_path")
+                    base="${rel%.*}"
+                    ext="${rel##*.}"
+                    echo "  Saving remote as ${base}.remote.${ext}"
+                    if run_retry proton-drive filesystem download \
+                        "$remote_path" "$local_parent"; then
+                        if [ "$DRY_RUN" = false ]; then
+                            mv "$local_parent/$(basename "$rel")" \
+                               "$local_parent/$(basename "${base}.remote.${ext}")" \
+                               2>/dev/null || true
+                        fi
+                    fi
+                    # Record current state; user resolves manually
+                    echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
                 fi
             else
-                # File doesn't exist remotely
+                # --- File does not exist remotely ---
                 if was_previously_synced "$rel"; then
-                    echo "[DELETED REMOTELY] $rel → removing local"
-                    rm "$local_path"
-                    continue
+                    # Deleted remotely — defer for move detection
+                    DELETED_REMOTELY_FILES+=("$rel")
                 else
-                    echo "[UPLOAD NEW] $rel"
-                    local parent_rel
-                    parent_rel=$(dirname "$rel")
-                    ensure_remote_folders "$parent_rel"
-                    local remote_parent
-                    remote_parent=$(dirname "$remote_path")
-                    proton-drive filesystem upload "$local_path" "$remote_parent"
-                    # Get remote fingerprint after upload
-                    local info
-                    info=$(proton-drive filesystem info "$remote_path" -j 2>/dev/null)
-                    local rsize rmtime
-                    rsize=$(echo "$info" | jq -r '.activeRevision.value.claimedSize // 0')
-                    rmtime=$(echo "$info" | jq -r '.activeRevision.value.claimedModificationTime // ""')
-                    local rmtime_epoch=0
-                    [ -n "$rmtime" ] && rmtime_epoch=$(date -d "$rmtime" +%s 2>/dev/null || echo 0)
-                    remote_fp="${rsize}|${rmtime_epoch}"
-                    local_fp=$(get_local_fingerprint "$local_path")
+                    # New local file — defer for move detection
+                    NEW_LOCAL_FILES+=("$rel")
+                    NEW_LOCAL_FP["$rel"]="$local_fp"
                 fi
             fi
-
-            echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
         fi
     done < "$LOCAL_MANIFEST"
 
     # --------------------------------------------------------
-    # PHASE 3: Process remote-only items
+    # PHASE 3: Scan remote-only items
     # --------------------------------------------------------
     echo ""
     echo "=== Processing remote-only items ==="
@@ -386,7 +623,6 @@ sync() {
         local_path="$LOCAL_DIR/$rel"
         remote_path="$REMOTE_DIR/$rel"
 
-        # Skip if already handled in Phase 2
         if [ -n "${LOCAL_ITEMS[${type}|${rel}]:-}" ]; then
             continue
         fi
@@ -399,8 +635,8 @@ sync() {
             fi
 
             if was_previously_synced "$rel"; then
-                echo "[DELETED LOCALLY] folder: $rel → trashing remote"
-                proton-drive filesystem trash "$remote_path"
+                # Deleted locally — defer
+                TRASH_REMOTE_FOLDERS+=("$rel")
             else
                 echo "[DOWNLOAD NEW FOLDER] $rel"
                 ensure_local_folders "$local_path"
@@ -414,35 +650,234 @@ sync() {
             fi
 
             if was_previously_synced "$rel"; then
-                echo "[DELETED LOCALLY] $rel → trashing remote"
-                proton-drive filesystem trash "$remote_path"
+                # Deleted locally — defer for move detection
+                TRASH_REMOTE_FILES+=("$rel")
             else
-                echo "[DOWNLOAD NEW] $rel"
-                local local_parent
-                local_parent=$(dirname "$local_path")
-                ensure_local_folders "$local_parent"
-                proton-drive filesystem download "$remote_path" "$local_parent"
-
-                if [ -f "$local_path" ]; then
-                    local local_fp remote_fp
-                    local_fp=$(get_local_fingerprint "$local_path")
-                    remote_fp="${size}|${mtime}"
-                    echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
-                else
-                    echo "[WARNING] Download failed or skipped: $rel"
-                fi
+                # New remote file — defer for move detection
+                NEW_REMOTE_FILES+=("$rel")
+                NEW_REMOTE_FP["$rel"]="${size}|${mtime}"
             fi
         fi
     done < "$REMOTE_MANIFEST"
 
     # --------------------------------------------------------
+    # PHASE 4: Move detection
+    # --------------------------------------------------------
+    echo ""
+    echo "=== Detecting moves ==="
+
+    # --- Local moves: new local file matches a locally-deleted
+    #     remote file's last-known LOCAL fingerprint ---
+    declare -A LFP_TO_OLD=()
+    local old_rel
+    for old_rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
+        local fp="${SNAPSHOT_LOCAL_FP[$old_rel]:-}"
+        if [ -n "$fp" ] && [ "$fp" != "0|0" ]; then
+            LFP_TO_OLD["$fp"]="$old_rel"
+        fi
+    done
+
+    declare -a REMAINING_NEW_LOCAL=()
+    local new_rel
+    for new_rel in "${NEW_LOCAL_FILES[@]+"${NEW_LOCAL_FILES[@]}"}"; do
+        local fp="${NEW_LOCAL_FP[$new_rel]}"
+        local match="${LFP_TO_OLD[$fp]:-}"
+        if [ -n "$match" ]; then
+            echo "[MOVE REMOTE] $match → $new_rel"
+            if do_remote_move "$match" "$new_rel"; then
+                COUNT_MOVED_REMOTE=$((COUNT_MOVED_REMOTE + 1))
+                local remote_fp="${SNAPSHOT_REMOTE_FP[$match]:-}"
+                echo "file|${new_rel}|${fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+                # Consume both sides of the match
+                unset "LFP_TO_OLD[$fp]"
+                TRASH_REMOTE_FILES=("${TRASH_REMOTE_FILES[@]/$match}")
+            else
+                COUNT_ERRORS=$((COUNT_ERRORS + 1))
+                echo "[SKIP] Move failed, will resolve next sync: $new_rel"
+            fi
+        else
+            REMAINING_NEW_LOCAL+=("$new_rel")
+        fi
+    done
+
+    # --- Remote moves: new remote file matches a remotely-deleted
+    #     local file's last-known REMOTE fingerprint ---
+    declare -A RFP_TO_OLD=()
+    for old_rel in "${DELETED_REMOTELY_FILES[@]+"${DELETED_REMOTELY_FILES[@]}"}"; do
+        local fp="${SNAPSHOT_REMOTE_FP[$old_rel]:-}"
+        if [ -n "$fp" ] && [ "$fp" != "0|0" ]; then
+            RFP_TO_OLD["$fp"]="$old_rel"
+        fi
+    done
+
+    declare -a REMAINING_NEW_REMOTE=()
+    for new_rel in "${NEW_REMOTE_FILES[@]+"${NEW_REMOTE_FILES[@]}"}"; do
+        local fp="${NEW_REMOTE_FP[$new_rel]}"
+        local match="${RFP_TO_OLD[$fp]:-}"
+        if [ -n "$match" ] && [ -f "$LOCAL_DIR/$match" ]; then
+            echo "[MOVE LOCAL] $match → $new_rel"
+            ensure_local_folders "$(dirname "$LOCAL_DIR/$new_rel")"
+            if run mv "$LOCAL_DIR/$match" "$LOCAL_DIR/$new_rel"; then
+                COUNT_MOVED_LOCAL=$((COUNT_MOVED_LOCAL + 1))
+                local local_fp
+                if [ "$DRY_RUN" = false ]; then
+                    local_fp=$(get_local_fingerprint "$LOCAL_DIR/$new_rel")
+                else
+                    local_fp="${SNAPSHOT_LOCAL_FP[$match]:-}"
+                fi
+                echo "file|${new_rel}|${local_fp}|${fp}" >> "$NEW_SNAPSHOT"
+                unset "RFP_TO_OLD[$fp]"
+                DELETED_REMOTELY_FILES=("${DELETED_REMOTELY_FILES[@]/$match}")
+            else
+                COUNT_ERRORS=$((COUNT_ERRORS + 1))
+                REMAINING_NEW_REMOTE+=("$new_rel")
+            fi
+        else
+            REMAINING_NEW_REMOTE+=("$new_rel")
+        fi
+    done
+
+    # --------------------------------------------------------
+    # PHASE 5: Execute remaining deferred actions
+    # --------------------------------------------------------
+    echo ""
+    echo "=== Executing remaining actions ==="
+
+    # Upload new local files
+    for rel in "${REMAINING_NEW_LOCAL[@]+"${REMAINING_NEW_LOCAL[@]}"}"; do
+        [ -z "$rel" ] && continue
+        local_path="$LOCAL_DIR/$rel"
+        remote_path="$REMOTE_DIR/$rel"
+        [ -f "$local_path" ] || continue
+
+        echo "[UPLOAD NEW] $rel"
+        local parent_rel
+        parent_rel=$(dirname "$rel")
+        ensure_remote_folders "$parent_rel"
+        if run_retry proton-drive filesystem upload \
+            "$local_path" "$(dirname "$remote_path")"; then
+            COUNT_UPLOADED=$((COUNT_UPLOADED + 1))
+            local local_fp remote_fp=""
+            local_fp=$(get_local_fingerprint "$local_path")
+            if [ "$DRY_RUN" = false ]; then
+                remote_fp=$(fetch_remote_fingerprint "$remote_path")
+            fi
+            if [ -n "$remote_fp" ]; then
+                echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+            fi
+            # If fingerprint fetch failed: no snapshot entry, retried next run
+        else
+            COUNT_ERRORS=$((COUNT_ERRORS + 1))
+            echo "[SKIP] Will retry next sync: $rel"
+        fi
+    done
+
+    # Download new remote files
+    for rel in "${REMAINING_NEW_REMOTE[@]+"${REMAINING_NEW_REMOTE[@]}"}"; do
+        [ -z "$rel" ] && continue
+        local_path="$LOCAL_DIR/$rel"
+        remote_path="$REMOTE_DIR/$rel"
+
+        echo "[DOWNLOAD NEW] $rel"
+        local local_parent
+        local_parent=$(dirname "$local_path")
+        ensure_local_folders "$local_parent"
+        if run_retry proton-drive filesystem download \
+            "$remote_path" "$local_parent"; then
+            if [ -f "$local_path" ]; then
+                COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
+                local local_fp
+                local_fp=$(get_local_fingerprint "$local_path")
+                echo "file|${rel}|${local_fp}|${NEW_REMOTE_FP[$rel]}" >> "$NEW_SNAPSHOT"
+            elif [ "$DRY_RUN" = false ]; then
+                COUNT_ERRORS=$((COUNT_ERRORS + 1))
+                echo "[WARNING] Download failed or skipped: $rel"
+            fi
+        else
+            COUNT_ERRORS=$((COUNT_ERRORS + 1))
+            echo "[SKIP] Will retry next sync: $rel"
+        fi
+    done
+
+    # Delete local files that were deleted remotely
+    for rel in "${DELETED_REMOTELY_FILES[@]+"${DELETED_REMOTELY_FILES[@]}"}"; do
+        [ -z "$rel" ] && continue
+        local_path="$LOCAL_DIR/$rel"
+        [ -f "$local_path" ] || continue
+        echo "[DELETED REMOTELY] $rel → removing local"
+        trash_local "$local_path" "$rel"
+        COUNT_DELETED_LOCAL=$((COUNT_DELETED_LOCAL + 1))
+    done
+
+    # Trash remote files that were deleted locally
+    for rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
+        [ -z "$rel" ] && continue
+        # Safety: never trash remote if it somehow exists locally
+        [ -f "$LOCAL_DIR/$rel" ] && continue
+        echo "[DELETED LOCALLY] $rel → trashing remote"
+        if run_retry proton-drive filesystem trash "$REMOTE_DIR/$rel"; then
+            COUNT_TRASHED_REMOTE=$((COUNT_TRASHED_REMOTE + 1))
+        else
+            COUNT_ERRORS=$((COUNT_ERRORS + 1))
+        fi
+    done
+
+    # Remove local folders that were deleted remotely
+    for rel in "${DEL_LOCAL_FOLDERS[@]+"${DEL_LOCAL_FOLDERS[@]}"}"; do
+        [ -z "$rel" ] && continue
+        local_path="$LOCAL_DIR/$rel"
+        [ -d "$local_path" ] || continue
+        echo "[DELETED REMOTELY] folder: $rel → removing local"
+        trash_local "$local_path" "$rel"
+        COUNT_DELETED_LOCAL=$((COUNT_DELETED_LOCAL + 1))
+    done
+
+    # Trash remote folders that were deleted locally
+    for rel in "${TRASH_REMOTE_FOLDERS[@]+"${TRASH_REMOTE_FOLDERS[@]}"}"; do
+        [ -z "$rel" ] && continue
+        [ -d "$LOCAL_DIR/$rel" ] && continue
+        echo "[DELETED LOCALLY] folder: $rel → trashing remote"
+        if run_retry proton-drive filesystem trash "$REMOTE_DIR/$rel"; then
+            COUNT_TRASHED_REMOTE=$((COUNT_TRASHED_REMOTE + 1))
+        else
+            COUNT_ERRORS=$((COUNT_ERRORS + 1))
+        fi
+    done
+
+    # --------------------------------------------------------
     # Finalize
     # --------------------------------------------------------
-    mv "$NEW_SNAPSHOT" "$SNAPSHOT"
+    if [ "$DRY_RUN" = true ]; then
+        echo ""
+        echo "[DRY RUN] Snapshot not updated."
+        rm -f "$NEW_SNAPSHOT"
+    else
+        mv "$NEW_SNAPSHOT" "$SNAPSHOT"
+    fi
     rm -f "$LOCAL_MANIFEST" "$REMOTE_MANIFEST"
 
+    cleanup_old_trash
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
     echo ""
-    echo "=== Sync complete ==="
+    echo "=== Sync Summary ==="
+    echo "  Unchanged:       $COUNT_OK"
+    echo "  First sync:      $COUNT_FIRST_SYNC"
+    echo "  Uploaded:        $COUNT_UPLOADED"
+    echo "  Downloaded:      $COUNT_DOWNLOADED"
+    echo "  Moved (remote):  $COUNT_MOVED_REMOTE"
+    echo "  Moved (local):   $COUNT_MOVED_LOCAL"
+    echo "  Deleted local:   $COUNT_DELETED_LOCAL"
+    echo "  Trashed remote:  $COUNT_TRASHED_REMOTE"
+    echo "  Conflicts:       $COUNT_CONFLICTS"
+    echo "  Errors:          $COUNT_ERRORS"
+
+    if [ "$COUNT_ERRORS" -gt 0 ]; then
+        return 1
+    fi
+    return 0
 }
 
 # ============================================================
@@ -450,9 +885,12 @@ sync() {
 # ============================================================
 
 echo "Proton Drive Sync"
-echo "Local:  $LOCAL_DIR"
-echo "Remote: $REMOTE_DIR"
-echo "State:  $STATE_DIR"
+echo "Local:   $LOCAL_DIR"
+echo "Remote:  $REMOTE_DIR"
+echo "State:   $STATE_DIR"
+[ "$DRY_RUN" = true ] && echo "Mode:    DRY RUN — no changes will be made"
 echo ""
 
+acquire_lock
+check_auth
 sync
