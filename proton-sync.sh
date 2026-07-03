@@ -5,7 +5,7 @@ set -euo pipefail
 # CONFIGURATION
 # ============================================================
 
-LOCAL_DIR="$HOME/Proton Drive/root-test"
+LOCAL_DIR="$HOME/Proton Drive/root"
 REMOTE_DIR="/my-files"
 STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/proton-sync"
 SNAPSHOT="$STATE_DIR/snapshot"
