@@ -110,12 +110,29 @@ On launch, the script verifies your Proton Drive authentication. If you're not l
 
 Exit via the **Quit** button (or `Esc`).
 
-### Environment Variables
+### Headless Mode (cron / systemd)
 
-Run headless or override defaults:
+Run a single sync without the menu, then exit. This mode doesn't need `dialog` and never prompts:
 
 ```bash
-# Preview mode
+./proton-sync-tui.sh --headless            # real sync
+./proton-sync-tui.sh --headless --dry-run  # preview only
+```
+
+The script also switches to headless mode automatically when there is no terminal (cron, systemd, pipes). It prints a summary and exits `1` if the sync hit errors, wasn't logged in, or another sync held the lock. Conflicts are left unresolved unless `PROTON_SYNC_CONFLICT` is set, because nobody is there to ask. Log in once interactively (`proton-drive auth login`) before scheduling it.
+
+Example crontab entry (hourly):
+
+```cron
+0 * * * * PROTON_SYNC_CONFLICT=both /path/to/proton-sync-tui.sh --headless
+```
+
+### Environment Variables
+
+Override defaults (these work in both interactive and headless mode):
+
+```bash
+# Preview mode (forces every sync, including "Run sync now", to be a dry run)
 PROTON_SYNC_DRY_RUN=true ./proton-sync-tui.sh
 
 # Non-interactive conflict handling (local | remote | both | skip)

@@ -40,7 +40,9 @@ DIALOG_HEIGHT=20
 DIALOG_WIDTH=76
 
 DEBUG="${PROTON_SYNC_DEBUG:-false}"
-DRY_RUN=false
+# PROTON_SYNC_DRY_RUN=true forces every sync (menu or headless) to be a dry run.
+FORCE_DRY_RUN="${PROTON_SYNC_DRY_RUN:-false}"
+DRY_RUN="$FORCE_DRY_RUN"
 
 # Conflict strategy: ask | local | remote | both | skip
 CONFLICT_STRATEGY="${PROTON_SYNC_CONFLICT:-ask}"
@@ -999,6 +1001,47 @@ sync_engine() {
 }
 
 # ============================================================
+# SYNC RUN HELPERS (shared by TUI and headless mode)
+# ============================================================
+
+load_conflicts() {
+    local conflict_dump="$1"
+    CONFLICTS=(); CONFLICT_LOCAL_FP=(); CONFLICT_REMOTE_FP=()
+    CONFLICT_PREV_L=(); CONFLICT_PREV_R=()
+    [ -s "$conflict_dump" ] || return 0
+    while IFS='|' read -r rel lfp_s lfp_m rfp_s rfp_m pl_s pl_m pr_s pr_m; do
+        CONFLICTS+=("$rel")
+        CONFLICT_LOCAL_FP["$rel"]="${lfp_s}|${lfp_m}"
+        CONFLICT_REMOTE_FP["$rel"]="${rfp_s}|${rfp_m}"
+        CONFLICT_PREV_L["$rel"]="${pl_s}|${pl_m}"
+        CONFLICT_PREV_R["$rel"]="${pr_s}|${pr_m}"
+    done < "$conflict_dump"
+}
+
+finalize_snapshot() {
+    if [ "$DRY_RUN" = true ]; then
+        log "[DRY RUN] Snapshot not updated."
+        rm -f "$NEW_SNAPSHOT"
+    else
+        mv "$NEW_SNAPSHOT" "$SNAPSHOT" 2>/dev/null || true
+    fi
+}
+
+sync_summary() {
+    printf "%s\n" \
+        "Unchanged:       $COUNT_OK" \
+        "First sync:      $COUNT_FIRST_SYNC" \
+        "Uploaded:        $COUNT_UPLOADED" \
+        "Downloaded:      $COUNT_DOWNLOADED" \
+        "Moved (remote):  $COUNT_MOVED_REMOTE" \
+        "Moved (local):   $COUNT_MOVED_LOCAL" \
+        "Deleted local:   $COUNT_DELETED_LOCAL" \
+        "Trashed remote:  $COUNT_TRASHED_REMOTE" \
+        "Conflicts:       $COUNT_CONFLICTS" \
+        "Errors:          $COUNT_ERRORS"
+}
+
+# ============================================================
 # TUI SCREENS
 # ============================================================
 
@@ -1037,6 +1080,7 @@ preflight() {
 
 run_sync_with_gauge() {
     local dry="$1"
+    [ "$FORCE_DRY_RUN" = true ] && dry=true
     DRY_RUN="$dry"
 
     preflight || return
@@ -1059,42 +1103,16 @@ run_sync_with_gauge() {
     sync_engine "$conflict_dump" | "$DIALOG" --backtitle "$DIALOG_BACKTITLE" \
         --title "$title" --gauge "Starting..." 10 "$DIALOG_WIDTH" 0
 
-    if [ -s "$conflict_dump" ]; then
-        CONFLICTS=(); CONFLICT_LOCAL_FP=(); CONFLICT_REMOTE_FP=()
-        CONFLICT_PREV_L=(); CONFLICT_PREV_R=()
-        while IFS='|' read -r rel lfp_s lfp_m rfp_s rfp_m pl_s pl_m pr_s pr_m; do
-            CONFLICTS+=("$rel")
-            CONFLICT_LOCAL_FP["$rel"]="${lfp_s}|${lfp_m}"
-            CONFLICT_REMOTE_FP["$rel"]="${rfp_s}|${rfp_m}"
-            CONFLICT_PREV_L["$rel"]="${pl_s}|${pl_m}"
-            CONFLICT_PREV_R["$rel"]="${pr_s}|${pr_m}"
-        done < "$conflict_dump"
-
-        resolve_all_conflicts
-    fi
+    load_conflicts "$conflict_dump"
+    [ "${#CONFLICTS[@]}" -gt 0 ] && resolve_all_conflicts
     rm -f "$conflict_dump"
 
-    if [ "$DRY_RUN" = true ]; then
-        log "[DRY RUN] Snapshot not updated."
-        rm -f "$NEW_SNAPSHOT"
-    else
-        mv "$NEW_SNAPSHOT" "$SNAPSHOT" 2>/dev/null || true
-    fi
+    finalize_snapshot
 
     release_lock
 
     local summary
-    summary=$(printf "%s\n" \
-        "Unchanged:       $COUNT_OK" \
-        "First sync:      $COUNT_FIRST_SYNC" \
-        "Uploaded:        $COUNT_UPLOADED" \
-        "Downloaded:      $COUNT_DOWNLOADED" \
-        "Moved (remote):  $COUNT_MOVED_REMOTE" \
-        "Moved (local):   $COUNT_MOVED_LOCAL" \
-        "Deleted local:   $COUNT_DELETED_LOCAL" \
-        "Trashed remote:  $COUNT_TRASHED_REMOTE" \
-        "Conflicts:       $COUNT_CONFLICTS" \
-        "Errors:          $COUNT_ERRORS")
+    summary=$(sync_summary)
 
     [ "$dry" = true ] && summary=$'DRY RUN — no changes were made.\n\n'"$summary"
 
@@ -1153,7 +1171,8 @@ Trash keep:  $TRASH_RETENTION_DAYS days
 Conflicts:   $CONFLICT_STRATEGY
 Excludes:    $excl
 
-Debug:       $DEBUG" 20 "$DIALOG_WIDTH"
+Debug:       $DEBUG
+Dry run:     $FORCE_DRY_RUN (forced via PROTON_SYNC_DRY_RUN)" 20 "$DIALOG_WIDTH"
 }
 
 edit_paths() {
@@ -1245,6 +1264,8 @@ toggle_debug() {
 }
 
 main_menu() {
+    local sync_label="Run sync now"
+    [ "$FORCE_DRY_RUN" = true ] && sync_label="Run sync now (DRY RUN forced by PROTON_SYNC_DRY_RUN)"
     while true; do
         local choice
         choice=$("$DIALOG" --backtitle "$DIALOG_BACKTITLE" \
@@ -1252,7 +1273,7 @@ main_menu() {
             --cancel-label "Quit" \
             --menu "Local:  $LOCAL_DIR\nRemote: $REMOTE_DIR\n\nChoose an action:" \
             "$DIALOG_HEIGHT" "$DIALOG_WIDTH" 11 \
-            sync     "Run sync now" \
+            sync     "$sync_label" \
             dryrun   "Preview sync (dry run)" \
             conflict "Set conflict strategy (currently: $CONFLICT_STRATEGY)" \
             log      "View latest sync log" \
@@ -1289,23 +1310,118 @@ main_menu() {
 }
 
 # ============================================================
+# HEADLESS MODE
+# ============================================================
+
+# Non-interactive sync for cron/systemd: no dialog, no prompts.
+# Exits 0 on success, 1 on any failure or transfer error.
+headless_sync() {
+    echo "Proton Drive Sync (headless)"
+    echo "Local:   $LOCAL_DIR"
+    echo "Remote:  $REMOTE_DIR"
+    echo "State:   $STATE_DIR"
+    [ "$DRY_RUN" = true ] && echo "Mode:    DRY RUN — no changes will be made"
+    echo
+
+    if ! acquire_lock; then
+        echo "ERROR: Another sync is already running (lock: $LOCK_FILE)" >&2
+        echo "If you are sure no sync is running, remove it manually:" >&2
+        echo "  rmdir '$LOCK_FILE'" >&2
+        return 1
+    fi
+
+    if ! is_authenticated; then
+        echo "ERROR: Cannot access $REMOTE_DIR — are you logged in?" >&2
+        echo "Run: proton-drive auth login" >&2
+        return 1
+    fi
+
+    # Conflicts can't be asked about without a terminal; leave them unresolved.
+    if [ "$CONFLICT_STRATEGY" = "ask" ]; then
+        CONFLICT_STRATEGY=skip
+    fi
+
+    local conflict_dump="$STATE_DIR/conflicts.tmp"
+    > "$conflict_dump"
+
+    # Run in the current shell (not a pipeline) so the counters survive.
+    if ! sync_engine "$conflict_dump" >/dev/null; then
+        rm -f "$conflict_dump" "$NEW_SNAPSHOT"
+        echo "ERROR: Remote listing came back empty but sync history exists." >&2
+        echo "Refusing to proceed. If the remote really is empty, reset with:" >&2
+        echo "  rm '$SNAPSHOT'" >&2
+        echo "Log: $LOG_FILE" >&2
+        return 1
+    fi
+
+    load_conflicts "$conflict_dump"
+    [ "${#CONFLICTS[@]}" -gt 0 ] && resolve_all_conflicts
+    rm -f "$conflict_dump"
+
+    finalize_snapshot
+    release_lock
+
+    echo "=== Sync Summary ==="
+    sync_summary | sed 's/^/  /'
+    [ "$CONFLICT_STRATEGY" = "skip" ] && [ "$COUNT_CONFLICTS" -gt 0 ] && \
+        echo "  ($COUNT_CONFLICTS conflict(s) left unresolved; set PROTON_SYNC_CONFLICT to resolve)"
+    echo "Log: $LOG_FILE"
+
+    [ "$COUNT_ERRORS" -eq 0 ]
+}
+
+usage() {
+    cat <<USAGE
+Usage: $(basename "$0") [--headless] [--dry-run] [--help]
+
+  (no options)  Start the interactive dialog menu.
+  --headless    Run one sync without the menu (for cron/systemd) and exit.
+                Also used automatically when there is no terminal.
+  --dry-run     Preview only; make no changes (same as PROTON_SYNC_DRY_RUN=true).
+  --help        Show this help.
+USAGE
+}
+
+# ============================================================
 # ENTRY POINT
 # ============================================================
+
+HEADLESS=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --headless|--sync) HEADLESS=true ;;
+        --dry-run) FORCE_DRY_RUN=true; DRY_RUN=true ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# No terminal (cron, systemd, piped) means the menu can't work.
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    HEADLESS=true
+fi
+
+if ! command -v proton-drive >/dev/null 2>&1; then
+    echo "ERROR: 'proton-drive' command not found in PATH." >&2
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: 'jq' is required but not installed." >&2
+    exit 1
+fi
+
+if [ "$HEADLESS" = true ]; then
+    headless_sync
+    exit $?
+fi
 
 if [ ! -x "$DIALOG" ]; then
     echo "ERROR: $DIALOG not found. Install it with:"
     echo "  sudo apt install dialog     # Debian/Ubuntu"
     echo "  sudo dnf install dialog     # Fedora"
-    exit 1
-fi
-
-if ! command -v proton-drive >/dev/null 2>&1; then
-    echo "ERROR: 'proton-drive' command not found in PATH."
-    exit 1
-fi
-
-if ! command -v jq >/dev/null 2>&1; then
-    echo "ERROR: 'jq' is required but not installed."
+    echo "Or run a single sync without the menu: $0 --headless"
     exit 1
 fi
 
