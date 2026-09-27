@@ -151,7 +151,7 @@ The script also switches to headless mode automatically when there is no termina
 
 Notes:
 
-- **Conflicts:** set `PROTON_SYNC_CONFLICT` in the crontab. Without it, conflicting files are skipped on every run. `both` is the safest choice: it keeps the local file and saves the remote copy beside it with `.remote` in the name.
+- **Conflicts:** set `PROTON_SYNC_CONFLICT` in the crontab. Without it, conflicting files are skipped on every run. `both` is the safest choice: the local version wins under the original name on both sides, and the remote version is kept beside it as a `.remote` copy.
 - **`XDG_DATA_HOME`:** if your shell sets it, set it in the crontab too. Otherwise cron keeps a separate sync history under `~/.local/share/proton-sync`, and its first run treats every file as new.
 - **"Not logged in" only under cron:** if a manual run works but cron reports `Cannot access ... are you logged in?`, `proton-drive` probably can't reach its stored login outside your desktop session.
 - **Stale lock:** if a sync is killed outright (for example, by a power loss), the lock stays behind and every later run exits with "Another sync is already running". Delete `~/.local/share/proton-sync/sync.lock` to clear it.
@@ -222,7 +222,7 @@ When a file changes on **both** sides since the last sync, you'll be prompted:
 |---|---|
 | **Keep LOCAL** | Upload local version, overwrite remote |
 | **Keep REMOTE** | Download remote version, overwrite local |
-| **Keep BOTH** | Download remote as `filename.remote.ext`, keep local |
+| **Keep BOTH** | Save the remote version locally as `filename.remote.ext` (or `.remote-2`, … if that exists), then upload the local version. The `.remote` copy is uploaded on the next sync |
 | **Skip** | Leave unresolved; re-prompted next sync |
 | **Keep LOCAL/REMOTE for ALL** | Apply that choice to every remaining conflict |
 
@@ -234,7 +234,8 @@ Set a non-interactive default via the menu or `PROTON_SYNC_CONFLICT`.
 
 - **Proton Docs** (`application/vnd.proton.doc`) are skipped — they're a proprietary format that can't be downloaded as regular files.
 - **Change detection uses size + modification time**, not content hashes. This is fast and reliable for typical use, but two different edits producing the same size and mtime won't be distinguished.
-- **Move detection matches on fingerprint** (size + mtime). Files with identical fingerprints may occasionally fall back to upload/download rather than a move — this is safe, just less efficient.
+- **Move detection matches on fingerprint** (size + mtime). A move is only recognized when its fingerprint is unique; files with identical fingerprints fall back to upload/download plus delete. This is safe, just less efficient.
+- **Filenames containing a line break** are skipped and noted in the log. All other characters, including `|` and leading or trailing spaces, are supported.
 - **First sync** establishes the baseline snapshot. Files existing on both sides are recorded without transfer; genuine differences are treated conservatively.
 - **Interactive conflicts require a terminal** — the gauge and conflict dialogs can't run fully unattended unless you set a `PROTON_SYNC_CONFLICT` strategy.
 - **Empty remote listing guard**: if the remote comes back empty (e.g., auth expired mid-run) but a snapshot exists, the sync aborts to avoid wiping local files.

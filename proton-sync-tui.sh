@@ -31,6 +31,10 @@ EXCLUDE_PATTERNS=(
     ".proton-sync"
 )
 
+# Field separator for manifests, snapshot and conflict list. The ASCII unit
+# separator can't realistically appear in a filename, unlike "|".
+SEP=$'\x1f'
+
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 touch "$SNAPSHOT"
 
@@ -112,6 +116,19 @@ acquire_lock() {
 release_lock() {
     rm -rf "$LOCK_FILE"
     trap - EXIT
+}
+
+# ============================================================
+# SNAPSHOT RECORDS
+# ============================================================
+
+# snap_file REL LOCAL_FP REMOTE_FP   (fingerprints are "size|mtime")
+snap_file() {
+    printf 'file%s%s%s%s%s%s\n' "$SEP" "$1" "$SEP" "$2" "$SEP" "$3" >> "$NEW_SNAPSHOT"
+}
+
+snap_folder() {
+    printf 'folder%s%s\n' "$SEP" "$1" >> "$NEW_SNAPSHOT"
 }
 
 # ============================================================
@@ -237,9 +254,10 @@ list_remote_recursive() {
             (if .mediaType | type == "object" then .mediaType.value else (.mediaType // "") end) as $media |
             (.activeRevision.value.claimedSize // 0) as $size |
             (.activeRevision.value.claimedModificationTime // "") as $mtime |
-            "\($type)|\($name)|\($media)|\($size)|\($mtime)"
+            if ($name | test("\n")) then "skip\u001f\($name | gsub("\n"; "\\n"))"
+            else "\($type)\u001f\($name)\u001f\($media)\u001f\($size)\u001f\($mtime)" end
         ' | \
-        while IFS='|' read -r type name media size mtime; do
+        while IFS="$SEP" read -r type name media size mtime; do
             local rel_path
             if [ -z "$prefix" ]; then
                 rel_path="$name"
@@ -247,12 +265,17 @@ list_remote_recursive() {
                 rel_path="$prefix/$name"
             fi
 
+            if [ "$type" = "skip" ]; then
+                log "[SKIP] remote name contains a line break: $rel_path"
+                continue
+            fi
+
             if is_excluded "$rel_path"; then
                 continue
             fi
 
             if [ "$type" = "folder" ]; then
-                echo "folder|$rel_path||"
+                printf 'folder%s%s%s%s\n' "$SEP" "$rel_path" "$SEP" "$SEP"
                 list_remote_recursive "$remote_path/$name" "$rel_path"
             else
                 if [ "$media" = "application/vnd.proton.doc" ]; then
@@ -263,7 +286,7 @@ list_remote_recursive() {
                 if [ -n "$mtime" ]; then
                     mtime_epoch=$(date -d "$mtime" +%s 2>/dev/null || echo 0)
                 fi
-                echo "file|$rel_path|$size|$mtime_epoch"
+                printf 'file%s%s%s%s%s%s\n' "$SEP" "$rel_path" "$SEP" "$size" "$SEP" "$mtime_epoch"
             fi
         done
 }
@@ -287,7 +310,7 @@ fetch_remote_fingerprint() {
 build_remote_dir_cache() {
     KNOWN_DIRS=()
     KNOWN_DIRS["/"]=1
-    while IFS='|' read -r type rel _rest; do
+    while IFS="$SEP" read -r type rel _rest; do
         [ "$type" = "folder" ] && KNOWN_DIRS["$rel"]=1
     done < "$REMOTE_MANIFEST"
 }
@@ -344,21 +367,29 @@ ensure_local_folders() {
 
 load_snapshot() {
     [ -f "$SNAPSHOT" ] || return 0
-    while IFS='|' read -r type rel f3 f4 f5 f6; do
-        [ -z "$type" ] && continue
+    local line type rel f3 f4 f5 f6 lfp rfp
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        if [[ "$line" == *"$SEP"* ]]; then
+            IFS="$SEP" read -r type rel lfp rfp <<< "$line"
+        else
+            # Snapshot written by an older version, separated by "|"
+            IFS='|' read -r type rel f3 f4 f5 f6 <<< "$line"
+            lfp="${f3}|${f4}"; rfp="${f5}|${f6}"
+        fi
         SNAPSHOT_SEEN["$rel"]=1
         if [ "$type" = "file" ]; then
-            SNAPSHOT_LOCAL_FP["$rel"]="${f3}|${f4}"
-            SNAPSHOT_REMOTE_FP["$rel"]="${f5}|${f6}"
+            SNAPSHOT_LOCAL_FP["$rel"]="$lfp"
+            SNAPSHOT_REMOTE_FP["$rel"]="$rfp"
         fi
     done < "$SNAPSHOT"
 }
 
 load_manifests_to_memory() {
-    while IFS='|' read -r type rel _size _mtime; do
+    while IFS="$SEP" read -r type rel; do
         LOCAL_ITEMS["${type}|${rel}"]=1
     done < "$LOCAL_MANIFEST"
-    while IFS='|' read -r type rel size mtime; do
+    while IFS="$SEP" read -r type rel size mtime; do
         if [ "$type" = "file" ]; then
             REMOTE_ITEMS["${type}|${rel}"]="${size}|${mtime}"
         else
@@ -525,10 +556,10 @@ resolve_keep_local() {
         else
             rfp="${CONFLICT_REMOTE_FP[$rel]}"
         fi
-        echo "file|${rel}|${lfp}|${rfp}" >> "$NEW_SNAPSHOT"
+        snap_file "${rel}" "${lfp}" "${rfp}"
     else
         COUNT_ERRORS=$((COUNT_ERRORS + 1))
-        echo "file|${rel}|${CONFLICT_PREV_L[$rel]}|${CONFLICT_PREV_R[$rel]}" >> "$NEW_SNAPSHOT"
+        snap_file "${rel}" "${CONFLICT_PREV_L[$rel]}" "${CONFLICT_PREV_R[$rel]}"
     fi
 }
 
@@ -546,35 +577,59 @@ resolve_keep_remote() {
         else
             lfp="${CONFLICT_LOCAL_FP[$rel]}"
         fi
-        echo "file|${rel}|${lfp}|${CONFLICT_REMOTE_FP[$rel]}" >> "$NEW_SNAPSHOT"
+        snap_file "${rel}" "${lfp}" "${CONFLICT_REMOTE_FP[$rel]}"
     else
         COUNT_ERRORS=$((COUNT_ERRORS + 1))
-        echo "file|${rel}|${CONFLICT_PREV_L[$rel]}|${CONFLICT_PREV_R[$rel]}" >> "$NEW_SNAPSHOT"
+        snap_file "${rel}" "${CONFLICT_PREV_L[$rel]}" "${CONFLICT_PREV_R[$rel]}"
     fi
 }
 
+# Keep both: save the remote version beside the local file as a ".remote"
+# copy, then upload the local file so both sides agree on the original name.
+# The copy is uploaded as a new file on the next sync.
 resolve_keep_both() {
     local rel="$1"
-    local local_path="$LOCAL_DIR/$rel"
     local remote_path="$REMOTE_DIR/$rel"
-    local local_parent base ext conflict_name
-    local_parent=$(dirname "$local_path")
-    base="${rel%.*}"
-    ext="${rel##*.}"
-    if [ "$base" = "$rel" ]; then
-        conflict_name="${rel}.remote"
-    else
-        conflict_name="${base}.remote.${ext}"
-    fi
-    log "[RESOLVE keep-both] $rel -> also saving remote as ${conflict_name}"
-    if run_retry proton-drive filesystem download "$remote_path" "$local_parent"; then
-        if [ "$DRY_RUN" = false ]; then
-            mv "$local_parent/$(basename "$rel")" \
-               "$(dirname "$LOCAL_DIR/$conflict_name")/$(basename "$conflict_name")" \
-               2>/dev/null || true
+    local dir name stem copy_name copy_rel n=1
+    dir=$(dirname "$rel")
+    name=$(basename "$rel")
+    stem="${name%.*}"
+
+    # Pick a name that doesn't exist yet: a.remote.txt, a.remote-2.txt, ...
+    while true; do
+        local tag=".remote"
+        [ "$n" -gt 1 ] && tag=".remote-$n"
+        if [ -z "$stem" ] || [ "$stem" = "$name" ]; then
+            copy_name="${name}${tag}"
+        else
+            copy_name="${stem}${tag}.${name##*.}"
         fi
+        if [ "$dir" = "." ]; then copy_rel="$copy_name"; else copy_rel="$dir/$copy_name"; fi
+        [ -e "$LOCAL_DIR/$copy_rel" ] || break
+        n=$((n + 1))
+    done
+
+    log "[RESOLVE keep-both] $rel -> saving remote version as $copy_rel"
+    if [ "$DRY_RUN" = true ]; then
+        log "[DRY RUN] download $remote_path -> $LOCAL_DIR/$copy_rel"
+    else
+        # Download into a scratch folder so the local file is never overwritten.
+        local tmp
+        tmp=$(mktemp -d "$STATE_DIR/download.XXXXXX")
+        if ! retry proton-drive filesystem download "$remote_path" "$tmp" \
+            || [ ! -f "$tmp/$name" ] \
+            || ! mv "$tmp/$name" "$LOCAL_DIR/$copy_rel"; then
+            rm -rf "$tmp"
+            log "[ERROR] Could not save remote copy of $rel; leaving conflict unresolved"
+            COUNT_ERRORS=$((COUNT_ERRORS + 1))
+            snap_file "$rel" "${CONFLICT_PREV_L[$rel]}" "${CONFLICT_PREV_R[$rel]}"
+            return
+        fi
+        rm -rf "$tmp"
+        COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
     fi
-    echo "file|${rel}|${CONFLICT_LOCAL_FP[$rel]}|${CONFLICT_REMOTE_FP[$rel]}" >> "$NEW_SNAPSHOT"
+
+    resolve_keep_local "$rel"
 }
 
 apply_conflict_resolution() {
@@ -586,7 +641,7 @@ apply_conflict_resolution() {
         both)   resolve_keep_both "$rel" ;;
         skip)
             log "[RESOLVE skip] $rel — leaving unresolved"
-            echo "file|${rel}|${CONFLICT_PREV_L[$rel]}|${CONFLICT_PREV_R[$rel]}" >> "$NEW_SNAPSHOT"
+            snap_file "${rel}" "${CONFLICT_PREV_L[$rel]}" "${CONFLICT_PREV_R[$rel]}"
             ;;
     esac
 }
@@ -611,7 +666,7 @@ How would you like to resolve it?" \
         18 "$DIALOG_WIDTH" 6 \
         local     "Keep LOCAL  (upload, overwrite remote)" \
         remote    "Keep REMOTE (download, overwrite local)" \
-        both      "Keep BOTH   (save remote as .remote copy)" \
+        both      "Keep BOTH   (local wins; remote saved as .remote copy)" \
         skip      "Skip        (decide later)" \
         alllocal  "Keep LOCAL for ALL remaining conflicts" \
         allremote "Keep REMOTE for ALL remaining conflicts" \
@@ -707,14 +762,18 @@ sync_engine() {
 
     gauge_update "Building local manifest..."
     > "$LOCAL_MANIFEST"
-    find "$LOCAL_DIR" -mindepth 1 | sort | \
-        while read -r path; do
-            rel="${path#$LOCAL_DIR/}"
+    find "$LOCAL_DIR" -mindepth 1 -print0 | sort -z | \
+        while IFS= read -r -d '' path; do
+            rel="${path#"$LOCAL_DIR"/}"
+            if [[ "$rel" == *$'\n'* ]]; then
+                log "[SKIP] local name contains a line break: ${rel//$'\n'/\\n}"
+                continue
+            fi
             is_excluded "$rel" && continue
             if [ -d "$path" ]; then
-                echo "folder|$rel" >> "$LOCAL_MANIFEST"
+                printf 'folder%s%s\n' "$SEP" "$rel" >> "$LOCAL_MANIFEST"
             else
-                echo "file|$rel" >> "$LOCAL_MANIFEST"
+                printf 'file%s%s\n' "$SEP" "$rel" >> "$LOCAL_MANIFEST"
             fi
         done
 
@@ -735,7 +794,7 @@ sync_engine() {
     TOTAL_ITEMS=$(( $(wc -l < "$LOCAL_MANIFEST") + $(wc -l < "$REMOTE_MANIFEST") + 2 ))
 
     # ---------- PHASE 2: local items ----------
-    while IFS='|' read -r type rel; do
+    while IFS="$SEP" read -r type rel; do
         gauge_update "Local: $rel"
         remote_path="$REMOTE_DIR/$rel"
         local_path="$LOCAL_DIR/$rel"
@@ -743,12 +802,12 @@ sync_engine() {
         if [ "$type" = "folder" ]; then
             if [ -n "${REMOTE_ITEMS[folder|${rel}]+x}" ]; then
                 log "[OK] folder: $rel"
-                echo "folder|${rel}|" >> "$NEW_SNAPSHOT"
+                snap_folder "$rel"
             elif was_previously_synced "$rel"; then
                 DEL_LOCAL_FOLDERS+=("$rel")
             else
                 ensure_remote_folders "$rel"
-                echo "folder|${rel}|" >> "$NEW_SNAPSHOT"
+                snap_folder "$rel"
             fi
 
         elif [ "$type" = "file" ]; then
@@ -766,11 +825,11 @@ sync_engine() {
                 if [ -z "$prev_local_fp" ] || [ -z "$prev_remote_fp" ]; then
                     log "[FIRST SYNC] $rel"
                     COUNT_FIRST_SYNC=$((COUNT_FIRST_SYNC + 1))
-                    echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+                    snap_file "${rel}" "${local_fp}" "${remote_fp}"
                 elif [ "$local_changed" = false ] && [ "$remote_changed" = false ]; then
                     log "[OK] $rel"
                     COUNT_OK=$((COUNT_OK + 1))
-                    echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+                    snap_file "${rel}" "${local_fp}" "${remote_fp}"
                 elif [ "$local_changed" = true ] && [ "$remote_changed" = false ]; then
                     log "[UPLOAD MODIFIED] $rel"
                     if run_retry proton-drive filesystem upload -f replace "$local_path" "$(dirname "$remote_path")"; then
@@ -779,10 +838,10 @@ sync_engine() {
                             remote_fp=$(fetch_remote_fingerprint "$remote_path")
                             local_fp=$(get_local_fingerprint "$local_path")
                         fi
-                        echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+                        snap_file "${rel}" "${local_fp}" "${remote_fp}"
                     else
                         COUNT_ERRORS=$((COUNT_ERRORS + 1))
-                        echo "file|${rel}|${prev_local_fp}|${prev_remote_fp}" >> "$NEW_SNAPSHOT"
+                        snap_file "${rel}" "${prev_local_fp}" "${prev_remote_fp}"
                     fi
                 elif [ "$local_changed" = false ] && [ "$remote_changed" = true ]; then
                     log "[DOWNLOAD MODIFIED] $rel"
@@ -790,15 +849,15 @@ sync_engine() {
                     if run_retry proton-drive filesystem download -f replace "$remote_path" "$(dirname "$local_path")"; then
                         COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
                         [ "$DRY_RUN" = false ] && local_fp=$(get_local_fingerprint "$local_path")
-                        echo "file|${rel}|${local_fp}|${remote_fp}" >> "$NEW_SNAPSHOT"
+                        snap_file "${rel}" "${local_fp}" "${remote_fp}"
                     else
                         COUNT_ERRORS=$((COUNT_ERRORS + 1))
-                        echo "file|${rel}|${prev_local_fp}|${prev_remote_fp}" >> "$NEW_SNAPSHOT"
+                        snap_file "${rel}" "${prev_local_fp}" "${prev_remote_fp}"
                     fi
                 else
                     log "[CONFLICT] $rel"
                     COUNT_CONFLICTS=$((COUNT_CONFLICTS + 1))
-                    echo "${rel}|${local_fp}|${remote_fp}|${prev_local_fp}|${prev_remote_fp}" \
+                    printf '%s\n' "${rel}${SEP}${local_fp}${SEP}${remote_fp}${SEP}${prev_local_fp}${SEP}${prev_remote_fp}" \
                         >> "$conflict_dump"
                 fi
             else
@@ -813,14 +872,14 @@ sync_engine() {
     done < "$LOCAL_MANIFEST"
 
     # ---------- PHASE 3: remote-only items ----------
-    while IFS='|' read -r type rel size mtime; do
+    while IFS="$SEP" read -r type rel size mtime; do
         gauge_update "Remote: $rel"
         local_path="$LOCAL_DIR/$rel"
         [ -n "${LOCAL_ITEMS[${type}|${rel}]:-}" ] && continue
 
         if [ "$type" = "folder" ]; then
             if [ -d "$local_path" ]; then
-                echo "folder|${rel}|" >> "$NEW_SNAPSHOT"
+                snap_folder "$rel"
                 continue
             fi
             if was_previously_synced "$rel"; then
@@ -828,7 +887,7 @@ sync_engine() {
             else
                 log "[DOWNLOAD NEW FOLDER] $rel"
                 ensure_local_folders "$local_path"
-                echo "folder|${rel}|" >> "$NEW_SNAPSHOT"
+                snap_folder "$rel"
             fi
         elif [ "$type" = "file" ]; then
             [ -f "$local_path" ] && continue
@@ -842,24 +901,36 @@ sync_engine() {
     done < "$REMOTE_MANIFEST"
 
     # ---------- PHASE 4: move detection ----------
+    # A file counts as moved only when its size+mtime fingerprint is unique
+    # on both sides; otherwise identical copies could be matched to the
+    # wrong file. Unmatched files fall through to plain upload/download/delete.
     gauge_update "Detecting moves..."
-    declare -A LFP_TO_OLD=()
     local old_rel new_rel fp match
+    declare -A OLD_FP_COUNT=() NEW_FP_COUNT=() FP_TO_OLD=() MOVED_FROM=()
+
     for old_rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
         fp="${SNAPSHOT_LOCAL_FP[$old_rel]:-}"
-        [ -n "$fp" ] && [ "$fp" != "0|0" ] && LFP_TO_OLD["$fp"]="$old_rel"
+        { [ -z "$fp" ] || [ "$fp" = "0|0" ]; } && continue
+        OLD_FP_COUNT["$fp"]=$(( ${OLD_FP_COUNT[$fp]:-0} + 1 ))
+        FP_TO_OLD["$fp"]="$old_rel"
+    done
+    for new_rel in "${NEW_LOCAL_FILES[@]+"${NEW_LOCAL_FILES[@]}"}"; do
+        fp="${NEW_LOCAL_FP[$new_rel]}"
+        NEW_FP_COUNT["$fp"]=$(( ${NEW_FP_COUNT[$fp]:-0} + 1 ))
     done
     declare -a REMAINING_NEW_LOCAL=()
     for new_rel in "${NEW_LOCAL_FILES[@]+"${NEW_LOCAL_FILES[@]}"}"; do
         fp="${NEW_LOCAL_FP[$new_rel]}"
-        match="${LFP_TO_OLD[$fp]:-}"
+        match=""
+        if [ "${OLD_FP_COUNT[$fp]:-0}" -eq 1 ] && [ "${NEW_FP_COUNT[$fp]:-0}" -eq 1 ]; then
+            match="${FP_TO_OLD[$fp]}"
+        fi
         if [ -n "$match" ]; then
             log "[MOVE REMOTE] $match -> $new_rel"
             if do_remote_move "$match" "$new_rel"; then
                 COUNT_MOVED_REMOTE=$((COUNT_MOVED_REMOTE + 1))
-                echo "file|${new_rel}|${fp}|${SNAPSHOT_REMOTE_FP[$match]:-}" >> "$NEW_SNAPSHOT"
-                unset "LFP_TO_OLD[$fp]"
-                TRASH_REMOTE_FILES=("${TRASH_REMOTE_FILES[@]/$match}")
+                snap_file "$new_rel" "$fp" "${SNAPSHOT_REMOTE_FP[$match]:-}"
+                MOVED_FROM["$match"]=1
             else
                 COUNT_ERRORS=$((COUNT_ERRORS + 1))
             fi
@@ -868,15 +939,24 @@ sync_engine() {
         fi
     done
 
-    declare -A RFP_TO_OLD=()
+    OLD_FP_COUNT=(); NEW_FP_COUNT=(); FP_TO_OLD=()
     for old_rel in "${DELETED_REMOTELY_FILES[@]+"${DELETED_REMOTELY_FILES[@]}"}"; do
         fp="${SNAPSHOT_REMOTE_FP[$old_rel]:-}"
-        [ -n "$fp" ] && [ "$fp" != "0|0" ] && RFP_TO_OLD["$fp"]="$old_rel"
+        { [ -z "$fp" ] || [ "$fp" = "0|0" ]; } && continue
+        OLD_FP_COUNT["$fp"]=$(( ${OLD_FP_COUNT[$fp]:-0} + 1 ))
+        FP_TO_OLD["$fp"]="$old_rel"
+    done
+    for new_rel in "${NEW_REMOTE_FILES[@]+"${NEW_REMOTE_FILES[@]}"}"; do
+        fp="${NEW_REMOTE_FP[$new_rel]}"
+        NEW_FP_COUNT["$fp"]=$(( ${NEW_FP_COUNT[$fp]:-0} + 1 ))
     done
     declare -a REMAINING_NEW_REMOTE=()
     for new_rel in "${NEW_REMOTE_FILES[@]+"${NEW_REMOTE_FILES[@]}"}"; do
         fp="${NEW_REMOTE_FP[$new_rel]}"
-        match="${RFP_TO_OLD[$fp]:-}"
+        match=""
+        if [ "${OLD_FP_COUNT[$fp]:-0}" -eq 1 ] && [ "${NEW_FP_COUNT[$fp]:-0}" -eq 1 ]; then
+            match="${FP_TO_OLD[$fp]}"
+        fi
         if [ -n "$match" ] && [ -f "$LOCAL_DIR/$match" ]; then
             log "[MOVE LOCAL] $match -> $new_rel"
             ensure_local_folders "$(dirname "$LOCAL_DIR/$new_rel")"
@@ -884,9 +964,8 @@ sync_engine() {
                 COUNT_MOVED_LOCAL=$((COUNT_MOVED_LOCAL + 1))
                 local lfp
                 if [ "$DRY_RUN" = false ]; then lfp=$(get_local_fingerprint "$LOCAL_DIR/$new_rel"); else lfp="${SNAPSHOT_LOCAL_FP[$match]:-}"; fi
-                echo "file|${new_rel}|${lfp}|${fp}" >> "$NEW_SNAPSHOT"
-                unset "RFP_TO_OLD[$fp]"
-                DELETED_REMOTELY_FILES=("${DELETED_REMOTELY_FILES[@]/$match}")
+                snap_file "$new_rel" "$lfp" "$fp"
+                MOVED_FROM["$match"]=1
             else
                 COUNT_ERRORS=$((COUNT_ERRORS + 1))
                 REMAINING_NEW_REMOTE+=("$new_rel")
@@ -909,7 +988,7 @@ sync_engine() {
             local lfp rfp=""
             lfp=$(get_local_fingerprint "$local_path")
             [ "$DRY_RUN" = false ] && rfp=$(fetch_remote_fingerprint "$remote_path")
-            [ -n "$rfp" ] && echo "file|${rel}|${lfp}|${rfp}" >> "$NEW_SNAPSHOT"
+            [ -n "$rfp" ] && snap_file "${rel}" "${lfp}" "${rfp}"
         else
             COUNT_ERRORS=$((COUNT_ERRORS + 1))
         fi
@@ -925,7 +1004,7 @@ sync_engine() {
             if [ -f "$local_path" ]; then
                 COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
                 local lfp; lfp=$(get_local_fingerprint "$local_path")
-                echo "file|${rel}|${lfp}|${NEW_REMOTE_FP[$rel]}" >> "$NEW_SNAPSHOT"
+                snap_file "${rel}" "${lfp}" "${NEW_REMOTE_FP[$rel]}"
             elif [ "$DRY_RUN" = false ]; then
                 COUNT_ERRORS=$((COUNT_ERRORS + 1))
             fi
@@ -935,7 +1014,7 @@ sync_engine() {
     done
 
     for rel in "${DELETED_REMOTELY_FILES[@]+"${DELETED_REMOTELY_FILES[@]}"}"; do
-        [ -z "$rel" ] && continue
+        [ -n "${MOVED_FROM[$rel]+x}" ] && continue
         local_path="$LOCAL_DIR/$rel"; [ -f "$local_path" ] || continue
         gauge_update "Delete local: $rel"
         log "[DELETED REMOTELY] $rel -> removing local"
@@ -944,7 +1023,7 @@ sync_engine() {
     done
 
     for rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
-        [ -z "$rel" ] && continue
+        [ -n "${MOVED_FROM[$rel]+x}" ] && continue
         [ -f "$LOCAL_DIR/$rel" ] && continue
         gauge_update "Trash remote: $rel"
         log "[DELETED LOCALLY] $rel -> trashing remote"
@@ -1009,12 +1088,13 @@ load_conflicts() {
     CONFLICTS=(); CONFLICT_LOCAL_FP=(); CONFLICT_REMOTE_FP=()
     CONFLICT_PREV_L=(); CONFLICT_PREV_R=()
     [ -s "$conflict_dump" ] || return 0
-    while IFS='|' read -r rel lfp_s lfp_m rfp_s rfp_m pl_s pl_m pr_s pr_m; do
+    local rel lfp rfp pl pr
+    while IFS="$SEP" read -r rel lfp rfp pl pr; do
         CONFLICTS+=("$rel")
-        CONFLICT_LOCAL_FP["$rel"]="${lfp_s}|${lfp_m}"
-        CONFLICT_REMOTE_FP["$rel"]="${rfp_s}|${rfp_m}"
-        CONFLICT_PREV_L["$rel"]="${pl_s}|${pl_m}"
-        CONFLICT_PREV_R["$rel"]="${pr_s}|${pr_m}"
+        CONFLICT_LOCAL_FP["$rel"]="$lfp"
+        CONFLICT_REMOTE_FP["$rel"]="$rfp"
+        CONFLICT_PREV_L["$rel"]="$pl"
+        CONFLICT_PREV_R["$rel"]="$pr"
     done < "$conflict_dump"
 }
 
