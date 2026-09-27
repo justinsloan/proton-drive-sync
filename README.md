@@ -30,7 +30,7 @@ A file synchronization tool for [Proton Drive](https://proton.me/drive) on Linux
 - 🚫 **Exclude patterns** — skip temp files, VCS directories, OS junk, etc.
 - 📊 **Progress & history** — progress bar, per-sync summary, and a browsable history of past syncs
 - 🔒 **Lock file** — prevents concurrent sync runs from corrupting state, and clears itself if a sync crashed
-- 🛡️ **Safety guards** — stops without changing anything if a remote folder can't be listed, or if the remote listing is empty while sync history exists
+- 🛡️ **Safety guards** — stops without changing anything if a remote folder can't be listed, or if either side is unexpectedly empty (an unplugged drive, a new computer) while sync history exists
 
 ---
 
@@ -140,7 +140,7 @@ The top of the menu shows the folder pair it's working with (the arrow shows the
 | **Preview sync** | List every file that would be uploaded, downloaded, moved or deleted (and what's not synced), without changing anything, then offer to run that sync |
 | **Restore deleted files** | Browse files that syncs deleted locally, and restore all or selected files to their original place |
 | **Sync history and logs** | Past syncs with their results; view each log in full or just its changes and problems |
-| **Folder pairs** | Add, change or remove folder pairs; set each pair's sync mode and skipped folders; choose which pair the menu uses |
+| **Folder pairs** | Add, change or remove folder pairs; set each pair's sync mode and skipped folders; start a pair fresh; choose which pair the menu uses |
 | **Settings** | Conflict handling, deletion safety limit, size limit, exclusions, notifications, retention, debug logging |
 | **Automatic sync** | Every hour, every 6 hours, daily, continuously, or off |
 | **Log in / Log out** | Manage your Proton Drive login |
@@ -163,6 +163,18 @@ Files that aren't synced (Proton Docs, which can't be downloaded, and files over
 
 If a sync would delete more files than your limit (Settings → Confirm deletions), nothing is changed until you confirm. From the menu you see the list of files and choose whether to go ahead. Headless and automatic syncs stop with an error and record it under **Last sync**; run a sync from the menu, or use `--allow-deletes`, to proceed.
 
+### Empty or missing local folder
+
+If a folder pair has been synced before and its local folder is now empty or missing, the app stops before changing anything. This covers an unplugged drive, a folder moved elsewhere, or setting up a new computer. Without this check, a two-way sync would treat the empty folder as "everything was deleted" and delete the files on Proton too. From the menu you can choose:
+
+- **Download everything from Proton (start fresh):** forgets the pair's sync history (kept as a backup) and syncs as if for the first time, so everything is downloaded and nothing is deleted.
+- **I deleted them:** also delete the files on Proton (two-way pairs only).
+- **Cancel:** for example, to connect the drive first.
+
+Headless and automatic syncs stop with an error instead; run `--headless --start-fresh --pair N` to download everything again. Backup-only pairs never delete on Proton, so they aren't stopped.
+
+You can also clear a pair's history yourself: **Folder pairs** → a pair → **Start fresh**.
+
 ### Headless Mode (cron / systemd)
 
 Sync without the menu, then exit. This mode doesn't need `dialog` and never prompts:
@@ -172,6 +184,7 @@ Sync without the menu, then exit. This mode doesn't need `dialog` and never prom
 ./proton-sync-tui.sh --headless --pair 2         # only folder pair 2
 ./proton-sync-tui.sh --headless --dry-run        # preview: prints the planned changes
 ./proton-sync-tui.sh --headless --allow-deletes  # skip the large-deletion stop
+./proton-sync-tui.sh --headless --start-fresh --pair 1  # forget pair 1's history, sync as if new
 ./proton-sync-tui.sh --status                    # folder pairs, last results, automatic sync
 ```
 
@@ -326,7 +339,7 @@ Choose a default in Settings → Conflicts, or with `PROTON_SYNC_CONFLICT`.
 - **Move detection matches on fingerprint** (size + mtime). A move is only recognized when its fingerprint is unique; files with identical fingerprints fall back to upload/download plus delete. This is safe, just less efficient.
 - **Filenames containing a line break** are skipped and noted in the log. All other characters, including `|` and leading or trailing spaces, are supported.
 - **First sync** establishes the baseline snapshot. Files existing on both sides are recorded without transfer; files on only one side are copied to the other; nothing is deleted.
-- **Empty remote listing guard**: if the remote comes back empty (e.g., auth expired mid-run) but a snapshot exists, the sync aborts to avoid wiping local files.
+- **Empty folder guards**: if Proton comes back empty (e.g., auth expired mid-run) but a snapshot exists, the sync aborts to avoid wiping local files. If the local folder is empty or missing but a snapshot exists, the sync stops and asks (see [Empty or missing local folder](#empty-or-missing-local-folder)).
 - **Continuous sync** reacts to local changes within seconds, but notices changes made on Proton Drive (for example, from another computer) only at its regular check (every 15 minutes by default).
 - **Bandwidth limits, file version history and checksum comparison** aren't supported, because they depend on options in the `proton-drive` CLI.
 - **Remote listing failures**: each remote folder listing is retried 3 times. If one still fails, the sync stops before making any changes, since that folder's files would otherwise look deleted.
@@ -338,8 +351,11 @@ Choose a default in Settings → Conflicts, or with `PROTON_SYNC_CONFLICT`.
 **"Another sync is already running"**
 Another sync really is running (for example, automatic sync), so wait for it to finish. A lock left by a sync that crashed is removed automatically. `--status` shows whether a sync is running.
 
-**Everything shows as re-downloading**
-Your snapshot may be out of date or missing. Check the log in **Sync history**. To start over for the current folders, delete the `snapshot` file in the folder shown under Settings → *Where settings, logs and trash are stored*. The next sync then behaves like a first sync: it copies files that exist on only one side and deletes nothing.
+**A first sync to an empty folder wants to delete files, or says the folder is empty**
+The app has sync history for these folders, for example from an earlier version or an earlier test. Choose **Download everything from Proton (start fresh)**, or use **Folder pairs** → the pair → **Start fresh** before syncing.
+
+**Everything shows as re-downloading, or the history looks wrong**
+Check the log in **Sync history**. To start over for a folder pair, use **Folder pairs** → the pair → **Start fresh** (or `--start-fresh --pair N`). The next sync then behaves like a first sync: it copies files that exist on only one side and deletes nothing.
 
 **Files keep re-uploading**
 Something is changing the local modification time between runs (e.g., an editor, backup tool, or filesystem quirk). Enable debug logging in Settings to inspect fingerprints.

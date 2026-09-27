@@ -265,6 +265,17 @@ migrate_legacy_state() {
     log "Moved sync history from an earlier version into $STATE_DIR"
 }
 
+# Forget the current pair's sync history (kept as snapshot.before-fresh-start),
+# so the next sync behaves like a first sync: files on only one side are
+# copied to the other side, and nothing is deleted.
+start_fresh() {
+    if [ -s "$SNAPSHOT" ]; then
+        mv -f "$SNAPSHOT" "$SNAPSHOT.before-fresh-start"
+    fi
+    : > "$SNAPSHOT"
+    log "Sync history cleared (start fresh); previous history kept as $SNAPSHOT.before-fresh-start"
+}
+
 # Deletion safety limit as text, e.g. "more than 50 files or 25%".
 delete_limit_text() {
     local -a parts=()
@@ -285,6 +296,11 @@ DRY_RUN="$FORCE_DRY_RUN"
 # Skip the large-deletion confirmation (--allow-deletes).
 ALLOW_DELETES="${PROTON_SYNC_ALLOW_DELETES:-false}"
 DELETE_WARNING=false
+# Set when the local folder is empty or missing although files were synced
+# from it before (empty | missing); EMPTY_OK=true lets such a sync go ahead.
+EMPTY_LOCAL=""
+EMPTY_WARNING=false
+EMPTY_OK=false
 
 # ============================================================
 # IN-MEMORY STATE
@@ -1261,6 +1277,12 @@ format_plan() {
         local IFS=,
         echo "${parts[*]}" | sed 's/,/, /g'
     fi
+    if [ "$EMPTY_WARNING" = true ]; then
+        echo
+        echo "Note: the local folder is $EMPTY_LOCAL, but files were synced from it"
+        echo "before. A real sync will stop and ask whether to download everything"
+        echo "again (start fresh) before changing anything."
+    fi
     if [ "$DELETE_WARNING" = true ]; then
         echo
         echo "Note: this is more deletions than your safety limit, so a real"
@@ -1351,6 +1373,8 @@ sync_engine() {
     local -a REUPLOAD=() REDOWNLOAD=()
     ABORT_REASON=""
     DELETE_WARNING=false
+    EMPTY_LOCAL=""
+    EMPTY_WARNING=false
     : > "$PLAN_FILE"
     rm -f "$PENDING_DELETES"
     COUNT_OK=0; COUNT_UPLOADED=0; COUNT_DOWNLOADED=0
@@ -1379,6 +1403,7 @@ sync_engine() {
         skip_excluded=(\( "${prune[@]}" \) -prune -o)
     fi
     local rec meta ftype fsize fmtime max_bytes=$((MAX_FILE_SIZE_MB * 1048576))
+    [ -d "$LOCAL_DIR" ] || EMPTY_LOCAL=missing
     find "$LOCAL_DIR" -mindepth 1 "${skip_excluded[@]}" \
         -printf '%P\t%Y %s %T@\0' | sort -z | \
         while IFS= read -r -d '' rec; do
@@ -1400,7 +1425,7 @@ sync_engine() {
                 d) printf 'folder%s%s\n' "$SEP" "$rel" ;;
                 f) printf 'file%s%s%s%s%s%s\n' "$SEP" "$rel" "$SEP" "$fsize" "$SEP" "$fmtime" ;;
             esac
-        done > "$LOCAL_MANIFEST"
+        done > "$LOCAL_MANIFEST" 2>/dev/null
 
     gauge 5 "Listing folders on Proton Drive..."
     if ! list_remote_tree > "$REMOTE_MANIFEST.unsorted"; then
@@ -1421,6 +1446,31 @@ sync_engine() {
     fi
 
     load_snapshot
+
+    # ---------- Empty or missing local folder ----------
+    # If files were synced from this folder before and it's now empty or
+    # gone (a drive that isn't mounted, a new computer), a two-way sync
+    # would delete everything on Proton, and a download-only one would fill
+    # the empty folder. Stop and let the user decide. Backup-only pairs
+    # never delete on Proton, so they carry on.
+    if [ "${#SNAPSHOT_LOCAL_FP[@]}" -gt 0 ] && [ "$SYNC_MODE" != upload ] && [ "$EMPTY_OK" != true ]; then
+        if [ -z "$EMPTY_LOCAL" ] && ! grep -q "^file$SEP" "$LOCAL_MANIFEST"; then
+            EMPTY_LOCAL=empty
+        fi
+        if [ -n "$EMPTY_LOCAL" ]; then
+            ABORT_REASON="The local folder $LOCAL_DIR is $EMPTY_LOCAL, but ${#SNAPSHOT_LOCAL_FP[@]} files were synced from it before."
+            if [ "$DRY_RUN" = true ]; then
+                EMPTY_WARNING=true
+            else
+                log "[STOPPED] $ABORT_REASON"
+                gauge 100 "Stopped: the local folder is $EMPTY_LOCAL"
+                return 4
+            fi
+        fi
+    else
+        EMPTY_LOCAL=""
+    fi
+
     load_manifests_to_memory
     build_remote_dir_cache
 
@@ -2095,6 +2145,8 @@ Wait for it to finish, then try again."
         release_lock
         if [ "$engine_rc" -eq 2 ]; then
             confirm_large_deletion "$quiet"
+        elif [ "$engine_rc" -eq 4 ]; then
+            confirm_empty_local "$quiet"
         else
             record_result "Stopped: $ABORT_REASON"
             LAST_RESULT="Stopped: $ABORT_REASON"
@@ -2189,6 +2241,48 @@ confirm_large_deletion() {
         LAST_RESULT="Stopped: $n deletions not confirmed"
         ui_msgbox "Sync Cancelled" "Nothing was changed. The next sync will ask again."
     fi
+}
+
+# The local folder is empty or missing although files were synced from it.
+confirm_empty_local() {
+    local quiet="${1:-}" n="${#SNAPSHOT_LOCAL_FP[@]}" choice text
+    local -a items=()
+    if [ "$EMPTY_LOCAL" = missing ]; then
+        text="The local folder doesn't exist:
+  $(display_path "$LOCAL_DIR")
+
+but $n files were synced from it before. If it's on a drive that isn't connected, connect the drive and try again.
+
+Nothing has been changed."
+        items=(fresh "Create it and download everything from Proton (start fresh)")
+    else
+        text="The local folder is empty:
+  $(display_path "$LOCAL_DIR")
+
+but $n files were synced from it before. This usually means a drive isn't mounted, or you're setting up this computer again.
+
+Nothing has been changed."
+        items=(fresh "Download everything from Proton (start fresh)")
+        [ "$SYNC_MODE" = two-way ] && items+=(deleted "I deleted them: delete them on Proton too")
+    fi
+    items+=(cancel "Cancel")
+    choice=$(ui_menu "Local Folder Is $EMPTY_LOCAL" "$text" "" fresh "${items[@]}") || choice=cancel
+    case "$choice" in
+        fresh)
+            start_fresh
+            mkdir -p "$LOCAL_DIR"
+            run_sync_with_gauge false "$quiet"
+            ;;
+        deleted)
+            EMPTY_OK=true; ALLOW_DELETES=true
+            run_sync_with_gauge false "$quiet"
+            EMPTY_OK=false; ALLOW_DELETES="${PROTON_SYNC_ALLOW_DELETES:-false}"
+            ;;
+        *)
+            record_result "Stopped: local folder is $EMPTY_LOCAL"
+            LAST_RESULT="Stopped: local folder is $EMPTY_LOCAL"
+            ;;
+    esac
 }
 
 # ============================================================
@@ -2683,6 +2777,7 @@ pair_menu() {
                 remote "Proton folder:    ${PAIR_REMOTE[$i]}"
                 mode   "Sync mode:        $(mode_label "${PAIR_MODE[$i]}")"
                 skip   "Skipped folders:  $skip_text"
+                fresh  "Start fresh (forget this pair's sync history)"
                 remove "Remove this folder pair")
         choice=$(ui_menu "Folder Pair $((i + 1))" "$(pair_label "$i")
 Last sync: $(pair_last_sync "$i")" "Back" "$choice" "${items[@]}") || return
@@ -2721,6 +2816,16 @@ Change it anyway?" "Change anyway" "Cancel" || continue
                 ;;
             skip)
                 skip_menu "$i"
+                ;;
+            fresh)
+                ui_yesno "Start Fresh" "Forget the sync history for $(pair_label "$i")?
+
+The next sync then works like a first sync: files that exist on only one side are copied to the other side, and nothing is deleted. Files you deleted on one side since the last sync will come back." "Start fresh" "Cancel" || continue
+                local saved="$CURRENT_PAIR"
+                select_pair "$i"
+                start_fresh
+                select_pair "$saved"
+                ui_msgbox "Start Fresh" "Done. The next sync of this folder pair works like a first sync."
                 ;;
             remove)
                 if [ "${#PAIR_LOCAL[@]}" -eq 1 ]; then
@@ -3229,6 +3334,14 @@ headless_sync() {
             echo >&2
             echo "To go ahead, run a sync from the menu, or run:" >&2
             echo "  $SCRIPT_PATH --headless --allow-deletes" >&2
+        elif [ "$rc" -eq 4 ]; then
+            record_result "Stopped: local folder is $EMPTY_LOCAL"
+            notify critical "Proton Drive Sync stopped" "$label: the local folder is $EMPTY_LOCAL. Connect the drive, or open the menu to download everything again."
+            echo >&2
+            echo "If the folder is on a drive that isn't connected, connect it and sync again." >&2
+            echo "To download everything from Proton again (start fresh), run:" >&2
+            echo "  $SCRIPT_PATH --headless --start-fresh --pair $((CURRENT_PAIR + 1))" >&2
+            echo "If you deleted everything on purpose, run a sync from the menu." >&2
         else
             record_result "Stopped: $ABORT_REASON"
             notify critical "Proton Drive Sync stopped" "$label: $ABORT_REASON"
@@ -3284,6 +3397,10 @@ headless_run() {
     [ -n "$ONLY_PAIR" ] && pairs=("$ONLY_PAIR")
     for i in "${pairs[@]}"; do
         select_pair "$i"
+        if [ "$START_FRESH" = true ] && [ "$DRY_RUN" != true ]; then
+            start_fresh
+            echo "Sync history for $(pair_label "$i") cleared; syncing as if for the first time."
+        fi
         rc=0
         headless_sync || rc=$?
         echo
@@ -3486,6 +3603,10 @@ Usage: $(basename "$0") [OPTIONS]
   --dry-run        Preview only; make no changes (same as PROTON_SYNC_DRY_RUN=true).
   --allow-deletes  Don't stop when a sync would delete more files than the
                    safety limit set in Settings.
+  --start-fresh    Forget a folder pair's sync history and sync it as if for
+                   the first time: files on only one side are copied to the
+                   other, nothing is deleted. Needs --pair N if you have
+                   several pairs.
   --watch          Continuous sync: sync local changes within seconds and
                    check Proton regularly. Runs until stopped.
   --status         Show folder pairs, last results and automatic sync, then exit.
@@ -3503,6 +3624,7 @@ USAGE
 # ============================================================
 
 HEADLESS=false
+START_FRESH=false
 ACTION=menu
 ONLY_PAIR=""
 while [ $# -gt 0 ]; do
@@ -3510,6 +3632,7 @@ while [ $# -gt 0 ]; do
         --headless|--sync) HEADLESS=true ;;
         --dry-run) FORCE_DRY_RUN=true; DRY_RUN=true ;;
         --allow-deletes) ALLOW_DELETES=true ;;
+        --start-fresh) START_FRESH=true ;;
         --pair|--pair=*)
             if [ "$1" = --pair ]; then shift; n="${1:-}"; else n="${1#--pair=}"; fi
             if ! is_number "$n" || [ "$n" -lt 1 ]; then
@@ -3533,6 +3656,11 @@ apply_env_overrides
 validate_settings
 mkdir -p "$STATE_ROOT"
 
+if [ "$START_FRESH" = true ] && [ -z "$ONLY_PAIR" ] && [ "$(pair_count)" -gt 1 ]; then
+    echo "--start-fresh needs --pair N when there is more than one folder pair (see --status)." >&2
+    exit 2
+fi
+[ "$START_FRESH" = true ] && HEADLESS=true
 if [ -n "$ONLY_PAIR" ] && [ "$ONLY_PAIR" -ge "$(pair_count)" ]; then
     echo "There is no folder pair $((ONLY_PAIR + 1)); there are $(pair_count) (see --status)." >&2
     exit 2
