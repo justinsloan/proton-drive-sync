@@ -1100,8 +1100,27 @@ run_sync_with_gauge() {
     local conflict_dump="$STATE_DIR/conflicts.tmp"
     > "$conflict_dump"
 
-    sync_engine "$conflict_dump" | "$DIALOG" --backtitle "$DIALOG_BACKTITLE" \
-        --title "$title" --gauge "Starting..." 10 "$DIALOG_WIDTH" 0
+    # Feed the gauge through a process substitution rather than a pipeline,
+    # so sync_engine runs in this shell and its counters and status survive.
+    local engine_rc=0
+    sync_engine "$conflict_dump" > >("$DIALOG" --backtitle "$DIALOG_BACKTITLE" \
+        --title "$title" --gauge "Starting..." 10 "$DIALOG_WIDTH" 0) || engine_rc=$?
+    wait "$!" 2>/dev/null || true
+
+    if [ "$engine_rc" -ne 0 ]; then
+        # Aborted before any changes: keep the existing snapshot untouched.
+        rm -f "$conflict_dump" "$NEW_SNAPSHOT" "$LOCAL_MANIFEST" "$REMOTE_MANIFEST"
+        release_lock
+        "$DIALOG" --backtitle "$DIALOG_BACKTITLE" --title "Sync Aborted" --msgbox \
+"Remote listing came back empty but sync history exists.
+Refusing to proceed; the snapshot was left unchanged.
+
+If the remote really is empty, remove:
+  $SNAPSHOT
+
+Log: $LOG_FILE" 14 "$DIALOG_WIDTH"
+        return
+    fi
 
     load_conflicts "$conflict_dump"
     [ "${#CONFLICTS[@]}" -gt 0 ] && resolve_all_conflicts
@@ -1346,7 +1365,7 @@ headless_sync() {
 
     # Run in the current shell (not a pipeline) so the counters survive.
     if ! sync_engine "$conflict_dump" >/dev/null; then
-        rm -f "$conflict_dump" "$NEW_SNAPSHOT"
+        rm -f "$conflict_dump" "$NEW_SNAPSHOT" "$LOCAL_MANIFEST" "$REMOTE_MANIFEST"
         echo "ERROR: Remote listing came back empty but sync history exists." >&2
         echo "Refusing to proceed. If the remote really is empty, reset with:" >&2
         echo "  rm '$SNAPSHOT'" >&2
