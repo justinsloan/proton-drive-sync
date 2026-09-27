@@ -15,7 +15,21 @@ TRASH_RETENTION_DAYS=30
 LOG_RETENTION_DAYS=90
 DELETE_CONFIRM_COUNT=50        # confirm before deleting more files than this (0 = off)
 DELETE_CONFIRM_PERCENT=25      # ...or more than this % of synced files (0 = off)
+MAX_FILE_SIZE_MB=0             # skip files larger than this (0 = no limit)
+NOTIFY=off                     # background sync notifications: off | problems | changes
+WATCH_POLL_MINUTES=15          # continuous sync: how often to check Proton for changes
+WATCH_DELAY_SECONDS=5          # continuous sync: wait this long after the last local change
 DEBUG=false
+
+# Folder pairs, edited from the Folder pairs menu. With no saved pairs,
+# LOCAL_DIR and REMOTE_DIR above become the first one.
+#   PAIR_MODE: two-way | upload (backup to Proton) | download (from Proton)
+#   PAIR_SKIP: folders or files (relative paths, one per line) not to sync
+PAIR_LOCAL=()
+PAIR_REMOTE=()
+PAIR_MODE=()
+PAIR_SKIP=()
+CURRENT_PAIR=0
 
 EXCLUDE_PATTERNS=(
     "*.tmp"
@@ -44,26 +58,46 @@ SEP=$'\x1f'
 # SETTINGS FILE
 # ============================================================
 
-SETTING_KEYS=(LOCAL_DIR REMOTE_DIR CONFLICT_STRATEGY SYNC_JOBS
+SETTING_KEYS=(CONFLICT_STRATEGY SYNC_JOBS
     TRASH_RETENTION_DAYS LOG_RETENTION_DAYS
-    DELETE_CONFIRM_COUNT DELETE_CONFIRM_PERCENT DEBUG)
+    DELETE_CONFIRM_COUNT DELETE_CONFIRM_PERCENT MAX_FILE_SIZE_MB
+    NOTIFY WATCH_POLL_MINUTES WATCH_DELAY_SECONDS CURRENT_PAIR DEBUG)
+ARRAY_KEYS=(EXCLUDE_PATTERNS PAIR_LOCAL PAIR_REMOTE PAIR_MODE PAIR_SKIP)
+declare -a CFG_EXCLUDE_PATTERNS=() CFG_PAIR_LOCAL=() CFG_PAIR_REMOTE=() CFG_PAIR_MODE=() CFG_PAIR_SKIP=()
+ENV_PAIR=false     # true when PROTON_SYNC_LOCAL_DIR / _REMOTE_DIR set the folders
 
 load_config() {
-    [ -f "$CONFIG_FILE" ] || return 0
-    # shellcheck source=/dev/null
-    if ! source "$CONFIG_FILE"; then
-        echo "WARNING: could not read settings from $CONFIG_FILE" >&2
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        if ! source "$CONFIG_FILE"; then
+            echo "WARNING: could not read settings from $CONFIG_FILE" >&2
+        fi
+    fi
+    # Settings from before folder pairs had a single LOCAL_DIR / REMOTE_DIR.
+    if [ "${#PAIR_LOCAL[@]}" -eq 0 ]; then
+        PAIR_LOCAL=("$LOCAL_DIR")
+        PAIR_REMOTE=("$REMOTE_DIR")
+        PAIR_MODE=(two-way)
+        PAIR_SKIP=("")
     fi
 }
 
+# copy_array SOURCE_NAME DEST_NAME
+copy_array() {
+    local -n _src="$1" _dst="$2"
+    _dst=("${_src[@]+"${_src[@]}"}")
+}
+
 # Keep a copy of the saved (not environment-overridden) values, so saving
-# from the Settings menu never writes a temporary override to the file.
+# from the menus never writes a temporary override to the file.
 remember_saved_settings() {
     local key
     for key in "${SETTING_KEYS[@]}"; do
         printf -v "CFG_$key" '%s' "${!key}"
     done
-    CFG_EXCLUDE_PATTERNS=("${EXCLUDE_PATTERNS[@]}")
+    for key in "${ARRAY_KEYS[@]}"; do
+        copy_array "$key" "CFG_$key"
+    done
 }
 
 save_config() {
@@ -71,14 +105,18 @@ save_config() {
     mkdir -p "$(dirname "$CONFIG_FILE")" || return 1
     {
         echo "# Proton Drive Sync settings, written by proton-sync-tui.sh."
-        echo "# Edit with the Settings menu, or by hand (this file is bash)."
+        echo "# Edit with the menus, or by hand (this file is bash)."
         for key in "${SETTING_KEYS[@]}"; do
             var="CFG_$key"
             printf '%s=%q\n' "$key" "${!var}"
         done
-        printf 'EXCLUDE_PATTERNS=('
-        printf ' %q' "${CFG_EXCLUDE_PATTERNS[@]}"
-        printf ' )\n'
+        for key in "${ARRAY_KEYS[@]}"; do
+            local -n _arr="CFG_$key"
+            printf '%s=(' "$key"
+            [ "${#_arr[@]}" -gt 0 ] && printf ' %q' "${_arr[@]}"
+            printf ' )\n'
+            unset -n _arr
+        done
     } > "$tmp" && mv "$tmp" "$CONFIG_FILE"
 }
 
@@ -89,9 +127,26 @@ set_setting() {
     save_config
 }
 
+# set_pair_field PAIR_ARRAY INDEX VALUE — change one folder pair and save it.
+set_pair_field() {
+    local -n _live="$1" _saved="CFG_$1"
+    _live[$2]="$3"
+    _saved[$2]="$3"
+    save_config
+}
+
 apply_env_overrides() {
-    LOCAL_DIR="${PROTON_SYNC_LOCAL_DIR:-$LOCAL_DIR}"
-    REMOTE_DIR="${PROTON_SYNC_REMOTE_DIR:-$REMOTE_DIR}"
+    if [ -n "${PROTON_SYNC_LOCAL_DIR:-}${PROTON_SYNC_REMOTE_DIR:-}" ]; then
+        # Folders given in the environment replace the pair list for this run.
+        ENV_PAIR=true
+        local i="$CURRENT_PAIR"
+        is_number "$i" && [ "$i" -lt "${#PAIR_LOCAL[@]}" ] || i=0
+        PAIR_LOCAL=("${PROTON_SYNC_LOCAL_DIR:-${PAIR_LOCAL[$i]}}")
+        PAIR_REMOTE=("${PROTON_SYNC_REMOTE_DIR:-${PAIR_REMOTE[$i]}}")
+        PAIR_MODE=("${PAIR_MODE[$i]:-two-way}")
+        PAIR_SKIP=("${PAIR_SKIP[$i]:-}")
+        CURRENT_PAIR=0
+    fi
     CONFLICT_STRATEGY="${PROTON_SYNC_CONFLICT:-$CONFLICT_STRATEGY}"
     SYNC_JOBS="${PROTON_SYNC_JOBS:-$SYNC_JOBS}"
     DEBUG="${PROTON_SYNC_DEBUG:-$DEBUG}"
@@ -101,16 +156,58 @@ is_number() {
     case "$1" in ''|*[!0-9]*) return 1 ;; esac
 }
 
+strip_slash() {
+    if [ "$1" = "/" ]; then echo "/"; else echo "${1%/}"; fi
+}
+
 validate_settings() {
     is_number "$SYNC_JOBS" && [ "$SYNC_JOBS" -gt 0 ] || SYNC_JOBS=4
     is_number "$TRASH_RETENTION_DAYS" || TRASH_RETENTION_DAYS=30
     is_number "$LOG_RETENTION_DAYS" || LOG_RETENTION_DAYS=90
     is_number "$DELETE_CONFIRM_COUNT" || DELETE_CONFIRM_COUNT=50
     is_number "$DELETE_CONFIRM_PERCENT" || DELETE_CONFIRM_PERCENT=25
+    is_number "$MAX_FILE_SIZE_MB" || MAX_FILE_SIZE_MB=0
+    is_number "$WATCH_POLL_MINUTES" && [ "$WATCH_POLL_MINUTES" -gt 0 ] || WATCH_POLL_MINUTES=15
+    is_number "$WATCH_DELAY_SECONDS" && [ "$WATCH_DELAY_SECONDS" -gt 0 ] || WATCH_DELAY_SECONDS=5
     case "$CONFLICT_STRATEGY" in ask|local|remote|both|skip) ;; *) CONFLICT_STRATEGY=ask ;; esac
+    case "$NOTIFY" in off|problems|changes) ;; *) NOTIFY=off ;; esac
     [ "$DEBUG" = true ] || DEBUG=false
-    [ "$LOCAL_DIR" != "/" ] && LOCAL_DIR="${LOCAL_DIR%/}"
-    [ "$REMOTE_DIR" != "/" ] && REMOTE_DIR="${REMOTE_DIR%/}"
+
+    local i
+    for i in "${!PAIR_LOCAL[@]}"; do
+        PAIR_LOCAL[$i]=$(strip_slash "${PAIR_LOCAL[$i]}")
+        PAIR_REMOTE[$i]=$(strip_slash "${PAIR_REMOTE[$i]:-/my-files}")
+        case "${PAIR_MODE[$i]:-}" in two-way|upload|download) ;; *) PAIR_MODE[$i]=two-way ;; esac
+        PAIR_SKIP[$i]="${PAIR_SKIP[$i]:-}"
+    done
+    is_number "$CURRENT_PAIR" && [ "$CURRENT_PAIR" -lt "${#PAIR_LOCAL[@]}" ] || CURRENT_PAIR=0
+}
+
+# select_pair INDEX — make a folder pair the one the engine and menus use.
+select_pair() {
+    CURRENT_PAIR="$1"
+    LOCAL_DIR="${PAIR_LOCAL[$1]}"
+    REMOTE_DIR="${PAIR_REMOTE[$1]}"
+    SYNC_MODE="${PAIR_MODE[$1]}"
+    SKIP_PATHS=()
+    local line
+    while IFS= read -r line; do
+        line="${line#/}"; line="${line%/}"
+        [ -n "$line" ] && SKIP_PATHS+=("$line")
+    done <<< "${PAIR_SKIP[$1]}"
+    init_state_paths
+}
+
+pair_count() {
+    echo "${#PAIR_LOCAL[@]}"
+}
+
+mode_label() {
+    case "$1" in
+        two-way)  echo "two-way" ;;
+        upload)   echo "backup to Proton (upload only)" ;;
+        download) echo "download from Proton only" ;;
+    esac
 }
 
 # ============================================================
@@ -209,6 +306,13 @@ declare -a TRASH_REMOTE_FOLDERS=()
 
 declare -A NEW_LOCAL_FP=()
 
+# Files not synced this run: rel -> reason (Proton Doc, over the size limit)
+declare -A NOT_SYNCED=()
+declare -A NOT_SYNCED_CARRY=()
+declare -a PROTON_DOCS=()
+SYNC_MODE=two-way
+declare -a SKIP_PATHS=()
+
 # Queued file transfers (run in parallel by run_job_queue)
 declare -a JOB_QUEUE=()
 declare -A JOB_LFP=() JOB_RFP=() JOB_PREV_L=() JOB_PREV_R=()
@@ -246,17 +350,57 @@ log() {
 # LOCKING
 # ============================================================
 
-acquire_lock() {
-    if ! mkdir "$LOCK_FILE" 2>/dev/null; then
-        return 1
-    fi
-    trap 'rm -rf "$LOCK_FILE"' EXIT
+# The lock is a folder holding the PID of the sync that owns it. A lock
+# left behind by a sync that is no longer running (a crash, kill -9 or
+# power loss) is removed automatically.
+LOCK_HELD=false
+WATCH_PID=""
+WATCH_FIFO=""
+
+# Runs on exit: release the lock if we hold it, stop the file watcher.
+cleanup_on_exit() {
+    [ "$LOCK_HELD" = true ] && rm -rf "$LOCK_FILE"
+    [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null
+    [ -n "$WATCH_FIFO" ] && rm -f "$WATCH_FIFO"
     return 0
+}
+trap cleanup_on_exit EXIT
+
+acquire_lock() {
+    local attempt
+    for attempt in 1 2; do
+        if mkdir "$LOCK_FILE" 2>/dev/null; then
+            echo "$$" > "$LOCK_FILE/pid"
+            LOCK_HELD=true
+            return 0
+        fi
+        lock_is_stale || return 1
+        rm -rf "$LOCK_FILE"
+        log "Removed a stale lock left by a sync that is no longer running"
+    done
+    return 1
+}
+
+lock_is_stale() {
+    local pid=""
+    [ -r "$LOCK_FILE/pid" ] && read -r pid < "$LOCK_FILE/pid"
+    if [ -z "$pid" ]; then
+        # No PID: made by an older version, or a sync that is just starting.
+        # Only treat it as stale once it is 12 hours old.
+        [ -n "$(find "$LOCK_FILE" -maxdepth 0 -mmin +720 2>/dev/null)" ]
+        return
+    fi
+    kill -0 "$pid" 2>/dev/null || return 0
+    # The PID is alive; if it was reused by an unrelated program, the lock is stale.
+    if [ -r "/proc/$pid/cmdline" ] && ! tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q proton; then
+        return 0
+    fi
+    return 1
 }
 
 release_lock() {
     rm -rf "$LOCK_FILE"
-    trap - EXIT
+    LOCK_HELD=false
 }
 
 # ============================================================
@@ -331,6 +475,31 @@ is_excluded() {
                 $pattern) return 0 ;;
             esac
         done
+    done
+    return 1
+}
+
+# is_skipped_path REL — true if REL is (inside) a folder the pair skips.
+is_skipped_path() {
+    local p
+    for p in "${SKIP_PATHS[@]+"${SKIP_PATHS[@]}"}"; do
+        # shellcheck disable=SC2053  # $p may contain wildcards on purpose
+        [[ "$1" == $p || "$1" == $p/* ]] && return 0
+    done
+    return 1
+}
+
+# windows_unsafe REL — true if a part of REL can't be used as a name on
+# Windows (reserved characters, trailing dot or space, reserved names).
+windows_unsafe() {
+    local part base
+    local -a parts
+    IFS='/' read -ra parts <<< "$1"
+    for part in "${parts[@]}"; do
+        [[ "$part" == *[\<\>:\"\\\|\?\*]* ]] && return 0
+        [[ "$part" == *[.\ ] ]] && return 0
+        base="${part%%.*}"
+        case "${base^^}" in CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]) return 0 ;; esac
     done
     return 1
 }
@@ -443,7 +612,7 @@ list_remote_dir() {
             continue
         fi
 
-        if is_excluded "$rel_path"; then
+        if is_excluded "$rel_path" || is_skipped_path "$rel_path"; then
             continue
         fi
 
@@ -452,6 +621,12 @@ list_remote_dir() {
         else
             if [ "$media" = "application/vnd.proton.doc" ]; then
                 log "[SKIP PROTON DOC] $rel_path"
+                printf 'doc%s%s\n' "$SEP" "$rel_path"
+                continue
+            fi
+            if [ "$MAX_FILE_SIZE_MB" -gt 0 ] && [ "$size" -gt $((MAX_FILE_SIZE_MB * 1048576)) ]; then
+                log "[SKIP TOO LARGE] Proton: $rel_path ($size bytes)"
+                printf 'big%s%s\n' "$SEP" "$rel_path"
                 continue
             fi
             local mtime_epoch=0
@@ -609,11 +784,20 @@ load_snapshot() {
 }
 
 load_manifests_to_memory() {
+    local limit="larger than $MAX_FILE_SIZE_MB MB"
     while IFS="$SEP" read -r type rel _size _mtime; do
-        LOCAL_ITEMS["${type}|${rel}"]=1
+        case "$type" in
+            big) NOT_SYNCED["$rel"]="$limit"; NOT_SYNCED_CARRY["$rel"]=1 ;;
+            *)   LOCAL_ITEMS["${type}|${rel}"]=1 ;;
+        esac
     done < "$LOCAL_MANIFEST"
     while IFS="$SEP" read -r type rel size mtime; do
-        if [ "$type" = "file" ]; then
+        if [ "$type" = "big" ]; then
+            NOT_SYNCED["$rel"]="$limit"; NOT_SYNCED_CARRY["$rel"]=1
+        elif [ "$type" = "doc" ]; then
+            NOT_SYNCED["$rel"]="Proton Doc, can't be downloaded"
+            PROTON_DOCS+=("$rel")
+        elif [ "$type" = "file" ]; then
             REMOTE_ITEMS["${type}|${rel}"]="${size}|${mtime}"
         else
             REMOTE_ITEMS["${type}|${rel}"]=""
@@ -1084,7 +1268,7 @@ format_plan() {
     fi
     awk -F'\t' '
         BEGIN {
-            n = split("up down move del_local del_remote conflict folder failed", order, " ")
+            n = split("up down move del_local del_remote conflict folder failed note skipped", order, " ")
             title["up"] = "Upload to Proton"
             title["down"] = "Download from Proton"
             title["move"] = "Move or rename"
@@ -1093,6 +1277,8 @@ format_plan() {
             title["conflict"] = "Conflicts, changed on both sides"
             title["folder"] = "New folders"
             title["failed"] = "Problems"
+            title["note"] = "Notes"
+            title["skipped"] = "Not synced"
         }
         { cat = $1; sub(/^[^\t]*\t/, ""); items[cat] = items[cat] "  " $0 "\n"; count[cat]++ }
         END {
@@ -1161,6 +1347,8 @@ sync_engine() {
     CONFLICTS=(); CONFLICT_LOCAL_FP=(); CONFLICT_REMOTE_FP=()
     CONFLICT_PREV_L=(); CONFLICT_PREV_R=()
     JOB_QUEUE=(); JOB_LFP=(); JOB_RFP=(); JOB_PREV_L=(); JOB_PREV_R=()
+    NOT_SYNCED=(); NOT_SYNCED_CARRY=(); PROTON_DOCS=()
+    local -a REUPLOAD=() REDOWNLOAD=()
     ABORT_REASON=""
     DELETE_WARNING=false
     : > "$PLAN_FILE"
@@ -1173,6 +1361,7 @@ sync_engine() {
     log "=== Sync started $(date) ==="
     log "Local:  $LOCAL_DIR"
     log "Proton: $REMOTE_DIR"
+    log "Mode:   $(mode_label "$SYNC_MODE")"
     [ "$DRY_RUN" = true ] && log "=== DRY RUN MODE ==="
 
     gauge 2 "Scanning local files..."
@@ -1189,7 +1378,7 @@ sync_engine() {
         unset 'prune[${#prune[@]}-1]'
         skip_excluded=(\( "${prune[@]}" \) -prune -o)
     fi
-    local rec meta ftype fsize fmtime
+    local rec meta ftype fsize fmtime max_bytes=$((MAX_FILE_SIZE_MB * 1048576))
     find "$LOCAL_DIR" -mindepth 1 "${skip_excluded[@]}" \
         -printf '%P\t%Y %s %T@\0' | sort -z | \
         while IFS= read -r -d '' rec; do
@@ -1201,6 +1390,12 @@ sync_engine() {
             fi
             ftype="${meta%% *}"; meta="${meta#* }"
             fsize="${meta%% *}"; fmtime="${meta#* }"; fmtime="${fmtime%.*}"
+            [ "${#SKIP_PATHS[@]}" -gt 0 ] && is_skipped_path "$rel" && continue
+            if [ "$ftype" = f ] && [ "$max_bytes" -gt 0 ] && [ "$fsize" -gt "$max_bytes" ]; then
+                log "[SKIP TOO LARGE] local: $rel ($fsize bytes)"
+                printf 'big%s%s\n' "$SEP" "$rel"
+                continue
+            fi
             case "$ftype" in
                 d) printf 'folder%s%s\n' "$SEP" "$rel" ;;
                 f) printf 'file%s%s%s%s%s%s\n' "$SEP" "$rel" "$SEP" "$fsize" "$SEP" "$fmtime" ;;
@@ -1246,7 +1441,9 @@ sync_engine() {
             if [ -n "${REMOTE_ITEMS[folder|${rel}]+x}" ]; then
                 log "[OK] folder: $rel"
                 snap_folder "$rel"
-            elif was_previously_synced "$rel"; then
+            elif [ "$SYNC_MODE" = download ]; then
+                continue    # never create folders on Proton
+            elif was_previously_synced "$rel" && [ "$SYNC_MODE" = two-way ]; then
                 DEL_LOCAL_FOLDERS+=("$rel")
             else
                 remote_dir_exists "$rel" || plan folder "On Proton: $rel"
@@ -1256,6 +1453,7 @@ sync_engine() {
 
         elif [ "$type" = "file" ]; then
             [ -f "$local_path" ] || continue
+            [ -n "${NOT_SYNCED[$rel]+x}" ] && continue
             local local_fp="${lsize}|${lmtime}"
             local prev_local_fp="${SNAPSHOT_LOCAL_FP[$rel]:-}"
             local prev_remote_fp="${SNAPSHOT_REMOTE_FP[$rel]:-}"
@@ -1275,6 +1473,26 @@ sync_engine() {
                     log "[OK] $rel"
                     COUNT_OK=$((COUNT_OK + 1))
                     snap_file "${rel}" "${local_fp}" "${remote_fp}"
+                elif [ "$local_changed" = true ] && [ "$SYNC_MODE" = download ]; then
+                    if [ "$remote_changed" = true ]; then
+                        # Both changed: the Proton version wins, the local copy goes to the trash.
+                        log "[DOWNLOAD MODIFIED] $rel (changed on both sides; local copy moved to trash)"
+                        plan down "$rel (changed on both sides; local copy kept in the local trash)"
+                        trash_local "$local_path" "$rel"
+                        queue_job down_mod "$rel" "$local_fp" "$remote_fp" "$prev_local_fp" "$prev_remote_fp"
+                    else
+                        log "[IGNORED] $rel changed locally (download-only folder pair)"
+                        snap_file "${rel}" "${local_fp}" "${remote_fp}"
+                    fi
+                elif [ "$remote_changed" = true ] && [ "$SYNC_MODE" = upload ]; then
+                    if [ "$local_changed" = true ]; then
+                        log "[UPLOAD MODIFIED] $rel (changed on both sides; local version kept)"
+                        plan up "$rel (changed on both sides; local version kept)"
+                        queue_job up_mod "$rel" "$local_fp" "$remote_fp" "$prev_local_fp" "$prev_remote_fp"
+                    else
+                        log "[IGNORED] $rel changed on Proton (backup-only folder pair)"
+                        snap_file "${rel}" "${local_fp}" "${remote_fp}"
+                    fi
                 elif [ "$local_changed" = true ] && [ "$remote_changed" = false ]; then
                     log "[UPLOAD MODIFIED] $rel"
                     plan up "$rel (changed)"
@@ -1290,13 +1508,19 @@ sync_engine() {
                     printf '%s\n' "${rel}${SEP}${local_fp}${SEP}${remote_fp}${SEP}${prev_local_fp}${SEP}${prev_remote_fp}" \
                         >> "$conflict_dump"
                 fi
-            else
-                if was_previously_synced "$rel"; then
-                    DELETED_REMOTELY_FILES+=("$rel")
-                else
-                    NEW_LOCAL_FILES+=("$rel")
+            elif was_previously_synced "$rel"; then
+                if [ "$SYNC_MODE" = upload ]; then
+                    # Missing on Proton: back it up again.
+                    REUPLOAD+=("$rel")
                     NEW_LOCAL_FP["$rel"]="$local_fp"
+                else
+                    # Two-way: deleted on Proton. Download-only: kept locally,
+                    # but still considered for local move detection.
+                    DELETED_REMOTELY_FILES+=("$rel")
                 fi
+            elif [ "$SYNC_MODE" != download ]; then
+                NEW_LOCAL_FILES+=("$rel")
+                NEW_LOCAL_FP["$rel"]="$local_fp"
             fi
         fi
     done < "$LOCAL_MANIFEST"
@@ -1314,7 +1538,8 @@ sync_engine() {
                 snap_folder "$rel"
                 continue
             fi
-            if was_previously_synced "$rel"; then
+            [ "$SYNC_MODE" = upload ] && continue    # never create local folders
+            if was_previously_synced "$rel" && [ "$SYNC_MODE" = two-way ]; then
                 TRASH_REMOTE_FOLDERS+=("$rel")
             else
                 log "[DOWNLOAD NEW FOLDER] $rel"
@@ -1324,14 +1549,32 @@ sync_engine() {
             fi
         elif [ "$type" = "file" ]; then
             [ -f "$local_path" ] && continue
+            [ -n "${NOT_SYNCED[$rel]+x}" ] && continue
             if was_previously_synced "$rel"; then
-                TRASH_REMOTE_FILES+=("$rel")
-            else
+                if [ "$SYNC_MODE" = download ]; then
+                    # Missing locally: download it again.
+                    REDOWNLOAD+=("$rel")
+                    NEW_REMOTE_FP["$rel"]="${size}|${mtime}"
+                else
+                    # Two-way: deleted locally. Backup-only: kept on Proton,
+                    # but still considered for move detection.
+                    TRASH_REMOTE_FILES+=("$rel")
+                fi
+            elif [ "$SYNC_MODE" != upload ]; then
                 NEW_REMOTE_FILES+=("$rel")
                 NEW_REMOTE_FP["$rel"]="${size}|${mtime}"
             fi
         fi
     done < "$REMOTE_MANIFEST"
+
+    # Files skipped for size keep their previous history, so they aren't
+    # treated as new or deleted if they shrink back under the limit.
+    for rel in "${!NOT_SYNCED[@]}"; do
+        plan skipped "$rel (${NOT_SYNCED[$rel]})"
+        if [ -n "${NOT_SYNCED_CARRY[$rel]+x}" ] && [ -n "${SNAPSHOT_LOCAL_FP[$rel]+x}" ]; then
+            snap_file "$rel" "${SNAPSHOT_LOCAL_FP[$rel]}" "${SNAPSHOT_REMOTE_FP[$rel]}"
+        fi
+    done
 
     # ---------- PHASE 4: move detection ----------
     # A file counts as moved only when its size+mtime fingerprint is unique
@@ -1390,17 +1633,23 @@ sync_engine() {
         fi
     done
 
+    REMAINING_NEW_LOCAL+=("${REUPLOAD[@]+"${REUPLOAD[@]}"}")
+    REMAINING_NEW_REMOTE+=("${REDOWNLOAD[@]+"${REDOWNLOAD[@]}"}")
+
     # ---------- Deletion safety check ----------
-    # Runs before any file is moved, transferred or deleted.
+    # Runs before any file is moved, transferred or deleted. One-way folder
+    # pairs never delete files.
     local -a deletions=()
-    for rel in "${DELETED_REMOTELY_FILES[@]+"${DELETED_REMOTELY_FILES[@]}"}"; do
-        [ -n "${MOVE_SRC[$rel]+x}" ] && continue
-        [ -f "$LOCAL_DIR/$rel" ] && deletions+=("Local (to local trash):   $rel")
-    done
-    for rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
-        [ -n "${MOVE_SRC[$rel]+x}" ] && continue
-        [ -f "$LOCAL_DIR/$rel" ] || deletions+=("Proton (to Proton trash): $rel")
-    done
+    if [ "$SYNC_MODE" = two-way ]; then
+        for rel in "${DELETED_REMOTELY_FILES[@]+"${DELETED_REMOTELY_FILES[@]}"}"; do
+            [ -n "${MOVE_SRC[$rel]+x}" ] && continue
+            [ -f "$LOCAL_DIR/$rel" ] && deletions+=("Local (to local trash):   $rel")
+        done
+        for rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
+            [ -n "${MOVE_SRC[$rel]+x}" ] && continue
+            [ -f "$LOCAL_DIR/$rel" ] || deletions+=("Proton (to Proton trash): $rel")
+        done
+    fi
     if [ "$ALLOW_DELETES" != true ] && deletions_exceed_limit "${#deletions[@]}"; then
         if [ "$DRY_RUN" = true ]; then
             DELETE_WARNING=true
@@ -1453,6 +1702,7 @@ sync_engine() {
         [ -f "$LOCAL_DIR/$rel" ] || continue
         log "[UPLOAD NEW] $rel"
         plan up "$rel"
+        windows_unsafe "$rel" && plan note "Name can't be used on Windows: $rel"
         # Folder creation updates KNOWN_DIRS, so it stays serial.
         ensure_remote_folders "$(dirname "$rel")"
         queue_job up_new "$rel" "${NEW_LOCAL_FP[$rel]}" "" "" ""
@@ -1467,6 +1717,7 @@ sync_engine() {
     done
 
     for rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
+        [ "$SYNC_MODE" = two-way ] || break
         [ -n "${MOVED_FROM[$rel]+x}" ] && continue
         [ -f "$LOCAL_DIR/$rel" ] && continue
         log "[DELETED LOCALLY] $rel -> trashing remote"
@@ -1480,6 +1731,7 @@ sync_engine() {
     process_job_results
 
     for rel in "${DELETED_REMOTELY_FILES[@]+"${DELETED_REMOTELY_FILES[@]}"}"; do
+        [ "$SYNC_MODE" = two-way ] || break
         [ -n "${MOVED_FROM[$rel]+x}" ] && continue
         local_path="$LOCAL_DIR/$rel"; [ -f "$local_path" ] || continue
         log "[DELETED REMOTELY] $rel -> removing local"
@@ -1575,6 +1827,12 @@ sync_summary() {
         "Trashed remote:  $COUNT_TRASHED_REMOTE" \
         "Conflicts:       $COUNT_CONFLICTS" \
         "Errors:          $COUNT_ERRORS"
+    local n
+    n=$(plan_count skipped)
+    [ "$n" -gt 0 ] && echo "Not synced:      $n (Proton Docs or over the size limit; see Preview)"
+    n=$(plan_count note)
+    [ "$n" -gt 0 ] && echo "Notes:           $n name(s) can't be used on Windows (see Preview)"
+    return 0
 }
 
 # ============================================================
@@ -1798,24 +2056,28 @@ preflight() {
 }
 
 # run_sync_with_gauge DRY_RUN — run one sync (or preview) with a progress bar.
+# run_sync_with_gauge DRY_RUN [quiet] — quiet (for Sync all) skips the
+# summary; LAST_RESULT holds the outcome either way.
 run_sync_with_gauge() {
-    local dry="$1"
+    local dry="$1" quiet="${2:-}"
     [ "$FORCE_DRY_RUN" = true ] && dry=true
     DRY_RUN="$dry"
 
+    LAST_RESULT="not logged in"
     preflight || return
 
     if ! acquire_lock; then
+        LAST_RESULT="another sync was running"
         ui_msgbox "Sync Already Running" "Another sync is running right now (lock: $LOCK_FILE).
 
-If you're sure none is running, delete that folder and try again."
+Wait for it to finish, then try again."
         return
     fi
 
     LOG_FILE="$LOG_DIR/sync-$(date +%Y%m%d-%H%M%S).log"
     LOCAL_TRASH="$TRASH_DIR/$(date +%Y%m%d-%H%M%S)"
 
-    local title="Syncing"
+    local title="${SYNC_TITLE:-Syncing}"
     [ "$dry" = true ] && title="Preview (no changes are made)"
 
     local conflict_dump="$STATE_DIR/conflicts.tmp"
@@ -1832,9 +2094,10 @@ If you're sure none is running, delete that folder and try again."
         rm -f "$conflict_dump" "$NEW_SNAPSHOT" "$LOCAL_MANIFEST" "$REMOTE_MANIFEST"
         release_lock
         if [ "$engine_rc" -eq 2 ]; then
-            confirm_large_deletion
+            confirm_large_deletion "$quiet"
         else
             record_result "Stopped: $ABORT_REASON"
+            LAST_RESULT="Stopped: $ABORT_REASON"
             ui_msgbox "Sync Stopped" "$ABORT_REASON
 
 No changes were made. Details are in the log:
@@ -1852,18 +2115,22 @@ $LOG_FILE"
     finalize_snapshot
     release_lock
 
+    LAST_RESULT=$(result_text)
     if [ "$DRY_RUN" = true ]; then
-        record_result "Preview: $(result_text)"
+        record_result "Preview: $LAST_RESULT"
         show_preview
     else
-        record_result "$(result_text)"
-        show_summary
+        record_result "$LAST_RESULT"
+        [ -z "$quiet" ] && show_summary
     fi
+    return 0
 }
 
 show_preview() {
-    if [ ! -s "$PLAN_FILE" ]; then
-        ui_msgbox "Preview" "Everything is already in sync. There's nothing to do."
+    if ! grep -qvE $'^(skipped|note)\t' "$PLAN_FILE" 2>/dev/null; then
+        local extra=""
+        [ "$(plan_count skipped)" -gt 0 ] && extra=$'\n\n'"$(plan_count skipped) file(s) aren't synced (Proton Docs or over the size limit)."
+        ui_msgbox "Preview" "Everything is already in sync. There's nothing to do.$extra"
         return
     fi
     local view="$STATE_DIR/view.txt" headline
@@ -1900,7 +2167,7 @@ show_summary() {
 
 # The sync stopped because it would delete more than the safety limit.
 confirm_large_deletion() {
-    local n view="$STATE_DIR/view.txt"
+    local quiet="${1:-}" n view="$STATE_DIR/view.txt"
     n=$(wc -l < "$PENDING_DELETES")
     {
         echo "$ABORT_REASON"
@@ -1915,10 +2182,11 @@ confirm_large_deletion() {
     rm -f "$view"
     if ui_yesno "Large Deletion" "Delete these $n files and finish the sync?" "Delete and sync" "Cancel"; then
         ALLOW_DELETES=true
-        run_sync_with_gauge false
+        run_sync_with_gauge false "$quiet"
         ALLOW_DELETES="${PROTON_SYNC_ALLOW_DELETES:-false}"
     else
         record_result "Stopped: $n deletions not confirmed"
+        LAST_RESULT="Stopped: $n deletions not confirmed"
         ui_msgbox "Sync Cancelled" "Nothing was changed. The next sync will ask again."
     fi
 }
@@ -2128,34 +2396,61 @@ restore_files() {
 # ============================================================
 
 settings_menu() {
-    local choice=local
+    local choice=conflict
     while true; do
-        choice=$(ui_menu "Settings" "Changes are saved right away and used by automatic syncs too." \
+        choice=$(ui_menu "Settings" "Changes are saved right away and used by automatic syncs too. Folders are set under Folder pairs." \
             "Back" "$choice" \
-            local    "Local folder:        $(display_path "$LOCAL_DIR")" \
-            remote   "Proton folder:       $REMOTE_DIR" \
-            conflict "Conflicts:           $(conflict_label)" \
-            jobs     "Parallel transfers:  $SYNC_JOBS" \
-            deletes  "Confirm deletions:   $(delete_limit_text)" \
-            excludes "Excluded names:      ${EXCLUDE_PATTERNS[*]}" \
-            trash    "Keep local trash:    $(days_text "$TRASH_RETENTION_DAYS")" \
-            logdays  "Keep logs:           $(days_text "$LOG_RETENTION_DAYS")" \
-            debug    "Debug logging:       $( [ "$DEBUG" = true ] && echo on || echo off )" \
+            conflict "Conflicts:            $(conflict_label)" \
+            jobs     "Parallel transfers:   $SYNC_JOBS" \
+            deletes  "Confirm deletions:    $(delete_limit_text)" \
+            maxsize  "Skip files larger than: $( [ "$MAX_FILE_SIZE_MB" -gt 0 ] && echo "$MAX_FILE_SIZE_MB MB" || echo "no limit" )" \
+            excludes "Excluded names:       ${EXCLUDE_PATTERNS[*]}" \
+            notify   "Notifications:        $(notify_label)" \
+            poll     "Continuous sync checks Proton every: $WATCH_POLL_MINUTES min" \
+            trash    "Keep local trash:     $(days_text "$TRASH_RETENTION_DAYS")" \
+            logdays  "Keep logs:            $(days_text "$LOG_RETENTION_DAYS")" \
+            debug    "Debug logging:        $( [ "$DEBUG" = true ] && echo on || echo off )" \
             where    "Where settings, logs and trash are stored") || return
         case "$choice" in
-            local|remote) change_folder "$choice" ;;
-            conflict)     choose_conflict_strategy ;;
-            jobs)         ask_number "Parallel Transfers" "How many transfers and folder listings should run at the same time? (1-16)
+            conflict) choose_conflict_strategy ;;
+            jobs)     ask_number "Parallel Transfers" "How many transfers and folder listings should run at the same time? (1-16)
 
 Lower this if Proton Drive starts refusing requests." SYNC_JOBS 1 16 ;;
-            deletes)      ask_delete_limits ;;
-            excludes)     edit_excludes ;;
-            trash)        ask_number "Local Trash" "Keep files that syncs delete locally for how many days? (0 = keep until you delete them)" TRASH_RETENTION_DAYS 0 36500 ;;
-            logdays)      ask_number "Logs" "Keep sync logs for how many days? (0 = keep forever)" LOG_RETENTION_DAYS 0 36500 ;;
-            debug)        if [ "$DEBUG" = true ]; then set_setting DEBUG false; else set_setting DEBUG true; fi ;;
-            where)        show_locations ;;
+            deletes)  ask_delete_limits ;;
+            maxsize)  ask_number "File Size Limit" "Skip files larger than how many MB? (0 = no limit)
+
+Skipped files are listed under \"Not synced\" in Preview, and are never deleted because of the limit." MAX_FILE_SIZE_MB 0 10000000 ;;
+            excludes) edit_excludes ;;
+            notify)   choose_notifications ;;
+            poll)     ask_number "Continuous Sync" "With continuous automatic sync, local changes are synced within seconds. How often should Proton Drive be checked for changes, in minutes? (1-1440)" WATCH_POLL_MINUTES 1 1440 ;;
+            trash)    ask_number "Local Trash" "Keep files that syncs delete locally for how many days? (0 = keep until you delete them)" TRASH_RETENTION_DAYS 0 36500 ;;
+            logdays)  ask_number "Logs" "Keep sync logs for how many days? (0 = keep forever)" LOG_RETENTION_DAYS 0 36500 ;;
+            debug)    if [ "$DEBUG" = true ]; then set_setting DEBUG false; else set_setting DEBUG true; fi ;;
+            where)    show_locations ;;
         esac
     done
+}
+
+notify_label() {
+    case "$NOTIFY" in
+        off)      echo "off" ;;
+        problems) echo "when something needs attention" ;;
+        changes)  echo "problems and every sync with changes" ;;
+    esac
+}
+
+choose_notifications() {
+    local value
+    value=$(ui_menu "Notifications" "Desktop notifications from automatic (background) syncs:" "Back" "$NOTIFY" \
+        off      "Off" \
+        problems "When something needs attention (errors, stops, conflicts)" \
+        changes  "Also after every sync that changed files") || return
+    set_setting NOTIFY "$value"
+    if [ "$value" != off ] && ! command -v notify-send >/dev/null 2>&1; then
+        ui_msgbox "Notifications" "Notifications need the notify-send command, which isn't installed.
+
+Install it (for example: sudo apt install libnotify-bin, or sudo dnf install libnotify)."
+    fi
 }
 
 days_text() {
@@ -2211,63 +2506,284 @@ choose_conflict_strategy() {
     set_setting CONFLICT_STRATEGY "$value"
 }
 
-change_folder() {
-    local which="$1" value
-    if [ "$which" = local ]; then
-        value=$(ui_input "Local Folder" "Folder on this computer to keep in sync:" "$LOCAL_DIR") || return
-        value="${value/#\~/$HOME}"
-        [ -z "$value" ] && return
-        [[ "$value" = /* ]] || value="$PWD/$value"
-        if [ ! -d "$value" ]; then
-            ui_yesno "Local Folder" "$value doesn't exist. Create it?" "Create" "Cancel" || return
-            if ! mkdir -p "$value"; then
-                ui_msgbox "Local Folder" "Couldn't create $value."
-                return
-            fi
-        fi
-        [ "$value" != "/" ] && value="${value%/}"
-        [ "$value" = "$LOCAL_DIR" ] && return
-        set_setting LOCAL_DIR "$value"
-    else
-        value=$(ui_input "Proton Folder" "Folder on Proton Drive to keep in sync (starts with /):" "$REMOTE_DIR") || return
-        [ -z "$value" ] && return
-        [[ "$value" = /* ]] || value="/$value"
-        [ "$value" != "/" ] && value="${value%/}"
-        [ "$value" = "$REMOTE_DIR" ] && return
-        ui_infobox "Proton Folder" "Checking $value on Proton Drive..."
-        if ! proton-drive filesystem list "$value" -j >/dev/null 2>&1; then
-            ui_yesno "Proton Folder" "Couldn't open $value on Proton Drive. It may not exist yet, or you may not be logged in.
-
-Use it anyway?" "Use it" "Cancel" || return
-        fi
-        set_setting REMOTE_DIR "$value"
-    fi
-
-    init_state_paths
-    if [ ! -s "$SNAPSHOT" ]; then
-        ui_msgbox "New Folder Pair" "These folders haven't been synced together before:
-
-  Local:  $LOCAL_DIR
-  Proton: $REMOTE_DIR
-
-The first sync copies files that exist on only one side to the other side, and doesn't delete anything. Use Preview sync first to see what it will do."
-    else
-        ui_msgbox "Folders Changed" "You've synced these folders together before, so their earlier history is used. Each folder pair keeps its own history, logs and trash."
-    fi
-}
-
 show_locations() {
     ui_msgbox "Where Things Are Stored" "Settings:      $CONFIG_FILE
+
+For $(pair_label "$CURRENT_PAIR"):
 Sync history:  $STATE_DIR
 Logs:          $LOG_DIR
 Local trash:   $TRASH_DIR
-Automatic sync output: $STATE_ROOT/cron.log
 
-Each local/Proton folder pair has its own history, logs and trash."
+Automatic sync output: $STATE_ROOT/cron.log (cron), or
+  journalctl --user -u proton-drive-sync (systemd)
+
+Each folder pair has its own history, logs and trash."
 }
 
 # ============================================================
-# ACCOUNT AND AUTOMATIC SYNC SCREENS
+# FOLDER PAIR SCREENS
+# ============================================================
+
+# pair_label INDEX — "~/Docs <-> /docs"; the arrow shows the sync direction.
+pair_label() {
+    local arrow="<->"
+    case "${PAIR_MODE[$1]}" in upload) arrow="->" ;; download) arrow="<-" ;; esac
+    echo "$(display_path "${PAIR_LOCAL[$1]}") $arrow ${PAIR_REMOTE[$1]}"
+}
+
+pair_state_dir() {
+    echo "$STATE_ROOT/pairs/$(pair_id "$1" "$2")"
+}
+
+# Last sync text for any pair (not just the current one).
+pair_last_sync() {
+    local f when text
+    f="$(pair_state_dir "${PAIR_LOCAL[$1]}" "${PAIR_REMOTE[$1]}")/last_status"
+    if [ -s "$f" ] && IFS=$'\t' read -r when text < "$f"; then
+        echo "$(ago "$when"): $text"
+    else
+        echo "never synced"
+    fi
+}
+
+paths_overlap() {
+    [ "$1" = "$2" ] || [ "$1" = "/" ] || [ "$2" = "/" ] \
+        || [[ "$1" == "$2"/* ]] || [[ "$2" == "$1"/* ]]
+}
+
+# overlap_warning INDEX LOCAL REMOTE — text describing another pair that
+# overlaps these folders (INDEX is the pair being edited, or -1 for new).
+overlap_warning() {
+    local skip="$1" loc="$2" rem="$3" i
+    for i in "${!PAIR_LOCAL[@]}"; do
+        [ "$i" = "$skip" ] && continue
+        if paths_overlap "$loc" "${PAIR_LOCAL[$i]}"; then
+            echo "The local folder overlaps folder pair $((i + 1)) ($(pair_label "$i")), so the same files would be synced twice."
+            return
+        fi
+        if paths_overlap "$rem" "${PAIR_REMOTE[$i]}"; then
+            echo "The Proton folder overlaps folder pair $((i + 1)) ($(pair_label "$i")), so the same files would be synced twice."
+            return
+        fi
+    done
+}
+
+# ask_local_folder DEFAULT — prints a checked absolute path.
+ask_local_folder() {
+    local value
+    value=$(ui_input "Local Folder" "Folder on this computer to keep in sync:" "$1") || return 1
+    value="${value/#\~/$HOME}"
+    [ -z "$value" ] && return 1
+    [[ "$value" = /* ]] || value="$PWD/$value"
+    if [ ! -d "$value" ]; then
+        ui_yesno "Local Folder" "$value doesn't exist. Create it?" "Create" "Cancel" || return 1
+        if ! mkdir -p "$value"; then
+            ui_msgbox "Local Folder" "Couldn't create $value."
+            return 1
+        fi
+    fi
+    strip_slash "$value"
+}
+
+# ask_remote_folder DEFAULT — prints a checked Proton path.
+ask_remote_folder() {
+    local value
+    value=$(ui_input "Proton Folder" "Folder on Proton Drive to keep in sync (starts with /):" "$1") || return 1
+    [ -z "$value" ] && return 1
+    [[ "$value" = /* ]] || value="/$value"
+    value=$(strip_slash "$value")
+    ui_infobox "Proton Folder" "Checking $value on Proton Drive..."
+    if ! proton-drive filesystem list "$value" -j >/dev/null 2>&1; then
+        ui_yesno "Proton Folder" "Couldn't open $value on Proton Drive. It may not exist yet, or you may not be logged in.
+
+Use it anyway?" "Use it" "Cancel" || return 1
+    fi
+    echo "$value"
+}
+
+# ask_mode CURRENT — prints two-way | upload | download.
+ask_mode() {
+    ui_menu "Sync Mode" "How should these folders be kept in sync?" "Back" "$1" \
+        two-way  "Two-way: changes and deletions go both ways" \
+        upload   "Backup to Proton: upload only, never delete or download" \
+        download "Download from Proton only: never upload or delete locally"
+}
+
+# Explain what happens on the first sync of a pair (or that history exists).
+pair_history_note() {
+    if [ -s "$(pair_state_dir "$1" "$2")/snapshot" ]; then
+        echo "You've synced these folders together before, so their earlier history is used. Each folder pair keeps its own history, logs and trash."
+    else
+        echo "These folders haven't been synced together before. The first sync copies files that exist on only one side to the other side, and doesn't delete anything. Use Preview sync first to see what it will do."
+    fi
+}
+
+pairs_menu() {
+    if [ "$ENV_PAIR" = true ]; then
+        ui_msgbox "Folder Pairs" "The folders are set by PROTON_SYNC_LOCAL_DIR / PROTON_SYNC_REMOTE_DIR for this run, so folder pairs can't be changed. Start the app without them to manage folder pairs."
+        return
+    fi
+    local choice="$CURRENT_PAIR" i mark
+    while true; do
+        local -a items=()
+        for i in "${!PAIR_LOCAL[@]}"; do
+            mark="  "; [ "$i" = "$CURRENT_PAIR" ] && mark="* "
+            items+=("$i" "$mark$((i + 1)). $(pair_label "$i")  ($(pair_last_sync "$i"))")
+        done
+        items+=(add "   Add a folder pair")
+        choice=$(ui_menu "Folder Pairs" "Each pair keeps a local folder and a Proton Drive folder in sync. * marks the pair the menu is using. Automatic sync covers all pairs." \
+            "Back" "$choice" "${items[@]}") || return
+        if [ "$choice" = add ]; then
+            add_pair
+            choice="$CURRENT_PAIR"
+        else
+            pair_menu "$choice"
+        fi
+    done
+}
+
+add_pair() {
+    local loc rem mode warn
+    loc=$(ask_local_folder "$HOME/") || return
+    rem=$(ask_remote_folder "/") || return
+    mode=$(ask_mode two-way) || return
+    warn=$(overlap_warning -1 "$loc" "$rem")
+    if [ -n "$warn" ]; then
+        ui_yesno "Overlapping Folders" "$warn
+
+Add this folder pair anyway?" "Add anyway" "Cancel" || return
+    fi
+    PAIR_LOCAL+=("$loc"); PAIR_REMOTE+=("$rem"); PAIR_MODE+=("$mode"); PAIR_SKIP+=("")
+    CFG_PAIR_LOCAL+=("$loc"); CFG_PAIR_REMOTE+=("$rem"); CFG_PAIR_MODE+=("$mode"); CFG_PAIR_SKIP+=("")
+    save_config
+    local n=$((${#PAIR_LOCAL[@]} - 1))
+    if ui_yesno "Folder Pair Added" "Added folder pair $((n + 1)): $(pair_label "$n")
+
+$(pair_history_note "$loc" "$rem")
+
+Use this folder pair in the menu now?" "Use it" "Not now"; then
+        use_pair "$n"
+    fi
+}
+
+use_pair() {
+    select_pair "$1"
+    CFG_CURRENT_PAIR="$1"
+    save_config
+}
+
+pair_menu() {
+    local i="$1" choice=local value warn
+    while true; do
+        local -a items=()
+        [ "$i" != "$CURRENT_PAIR" ] && items+=(use "Use this folder pair in the menu")
+        local skip_text="none"
+        [ -n "${PAIR_SKIP[$i]}" ] && skip_text="$(grep -c . <<< "${PAIR_SKIP[$i]}") folder(s)"
+        items+=(local  "Local folder:     $(display_path "${PAIR_LOCAL[$i]}")"
+                remote "Proton folder:    ${PAIR_REMOTE[$i]}"
+                mode   "Sync mode:        $(mode_label "${PAIR_MODE[$i]}")"
+                skip   "Skipped folders:  $skip_text"
+                remove "Remove this folder pair")
+        choice=$(ui_menu "Folder Pair $((i + 1))" "$(pair_label "$i")
+Last sync: $(pair_last_sync "$i")" "Back" "$choice" "${items[@]}") || return
+        case "$choice" in
+            use)
+                use_pair "$i"
+                return
+                ;;
+            local|remote)
+                if [ "$choice" = local ]; then
+                    value=$(ask_local_folder "${PAIR_LOCAL[$i]}") || continue
+                    [ "$value" = "${PAIR_LOCAL[$i]}" ] && continue
+                    warn=$(overlap_warning "$i" "$value" "${PAIR_REMOTE[$i]}")
+                else
+                    value=$(ask_remote_folder "${PAIR_REMOTE[$i]}") || continue
+                    [ "$value" = "${PAIR_REMOTE[$i]}" ] && continue
+                    warn=$(overlap_warning "$i" "${PAIR_LOCAL[$i]}" "$value")
+                fi
+                if [ -n "$warn" ]; then
+                    ui_yesno "Overlapping Folders" "$warn
+
+Change it anyway?" "Change anyway" "Cancel" || continue
+                fi
+                if [ "$choice" = local ]; then
+                    set_pair_field PAIR_LOCAL "$i" "$value"
+                else
+                    set_pair_field PAIR_REMOTE "$i" "$value"
+                fi
+                [ "$i" = "$CURRENT_PAIR" ] && select_pair "$i"
+                ui_msgbox "Folders Changed" "$(pair_history_note "${PAIR_LOCAL[$i]}" "${PAIR_REMOTE[$i]}")"
+                ;;
+            mode)
+                value=$(ask_mode "${PAIR_MODE[$i]}") || continue
+                set_pair_field PAIR_MODE "$i" "$value"
+                [ "$i" = "$CURRENT_PAIR" ] && select_pair "$i"
+                ;;
+            skip)
+                skip_menu "$i"
+                ;;
+            remove)
+                if [ "${#PAIR_LOCAL[@]}" -eq 1 ]; then
+                    ui_msgbox "Remove Folder Pair" "This is the only folder pair. Change its folders instead, or add another pair first."
+                    continue
+                fi
+                ui_yesno "Remove Folder Pair" "Stop syncing $(pair_label "$i")?
+
+No files are deleted, and its history is kept in case you add it again." "Remove" "Cancel" || continue
+                remove_pair "$i"
+                return
+                ;;
+        esac
+    done
+}
+
+remove_pair() {
+    local i="$1" key
+    for key in PAIR_LOCAL PAIR_REMOTE PAIR_MODE PAIR_SKIP; do
+        local -n _live="$key" _saved="CFG_$key"
+        _live=("${_live[@]:0:$i}" "${_live[@]:$((i + 1))}")
+        _saved=("${_saved[@]:0:$i}" "${_saved[@]:$((i + 1))}")
+        unset -n _live _saved
+    done
+    local cur="$CURRENT_PAIR"
+    if [ "$cur" -eq "$i" ]; then
+        cur=0
+    elif [ "$cur" -gt "$i" ]; then
+        cur=$((cur - 1))
+    fi
+    select_pair "$cur"
+    CFG_CURRENT_PAIR="$cur"
+    save_config
+}
+
+# Folders (or files) inside the pair that are never synced.
+skip_menu() {
+    local i="$1" choice value
+    while true; do
+        local -a items=() paths=()
+        local p n=0
+        while IFS= read -r p; do
+            [ -n "$p" ] && { paths+=("$p"); items+=("$n" "Stop skipping: $p"); n=$((n + 1)); }
+        done <<< "${PAIR_SKIP[$i]}"
+        items+=(add "Add a folder to skip")
+        choice=$(ui_menu "Skipped Folders" "These folders (and everything in them) are never synced in either direction, for $(pair_label "$i"). Paths are relative to the pair's folders; * and ? work as wildcards." \
+            "Back" "" "${items[@]}") || return
+        if [ "$choice" = add ]; then
+            value=$(ui_input "Skip a Folder" "Folder to skip, relative to $(display_path "${PAIR_LOCAL[$i]}") (for example: Photos/2019):" "") || continue
+            value="${value/#${PAIR_LOCAL[$i]}\//}"
+            value="${value#/}"; value="${value%/}"
+            [ -z "$value" ] && continue
+            paths+=("$value")
+        else
+            paths=("${paths[@]:0:$choice}" "${paths[@]:$((choice + 1))}")
+        fi
+        set_pair_field PAIR_SKIP "$i" "$(printf '%s\n' "${paths[@]+"${paths[@]}"}" | sed '/^$/d')"
+        [ "$i" = "$CURRENT_PAIR" ] && select_pair "$i"
+    done
+}
+
+# ============================================================
+# ACCOUNT SCREEN
 # ============================================================
 
 account_action() {
@@ -2288,33 +2804,76 @@ Syncs, including automatic ones, won't work until you log in again." "Log out" "
     fi
 }
 
+# ============================================================
+# AUTOMATIC SYNC (systemd user timer / service, or cron)
+# ============================================================
+
 CRON_MARKER="# proton-drive-sync"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+TIMER_UNIT="proton-drive-sync.timer"
+SERVICE_UNIT="proton-drive-sync.service"
+WATCH_UNIT="proton-drive-sync-watch.service"
+
+systemd_available() {
+    command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
+cron_available() {
+    command -v crontab >/dev/null 2>&1
+}
 
 cron_entry() {
+    cron_available || return 0
     crontab -l 2>/dev/null | grep -F "$CRON_MARKER" | head -1
 }
 
-describe_schedule() {
-    local min hour dom mon dow
-    read -r min hour dom mon dow _ <<< "$1"
-    if [ "$dom $mon $dow" != "* * *" ]; then
-        echo "custom schedule"
-    elif [ "$hour" = "*" ]; then
-        echo "every hour"
-    elif [ "$hour" = "*/6" ]; then
-        echo "every 6 hours"
-    elif is_number "$hour" && is_number "$min"; then
-        printf 'daily at %02d:%02d\n' "$((10#$hour))" "$((10#$min))"
-    else
-        echo "custom schedule"
+# schedule_kind — off | hourly | six | daily | watch | custom, read from
+# what is actually installed.
+schedule_kind() {
+    local line min hour dom mon dow cal
+    if [ -f "$UNIT_DIR/$WATCH_UNIT" ]; then
+        echo watch; return
+    fi
+    if [ -f "$UNIT_DIR/$TIMER_UNIT" ]; then
+        cal=$(sed -n 's/^OnCalendar=//p' "$UNIT_DIR/$TIMER_UNIT")
+        case "$cal" in
+            "*-*-* *:"*)     echo hourly ;;
+            "*-*-* 00/6:"*)  echo six ;;
+            "*-*-* 03:"*)    echo daily ;;
+            *)               echo custom ;;
+        esac
+        return
+    fi
+    line=$(cron_entry)
+    if [ -z "$line" ]; then
+        echo off; return
+    fi
+    read -r min hour dom mon dow _ <<< "$line"
+    if [ "$dom $mon $dow" != "* * *" ]; then echo custom
+    elif [ "$hour" = "*" ]; then echo hourly
+    elif [ "$hour" = "*/6" ]; then echo six
+    elif [ "$hour" = "3" ]; then echo daily
+    else echo custom
+    fi
+}
+
+schedule_backend() {
+    if [ -f "$UNIT_DIR/$WATCH_UNIT" ] || [ -f "$UNIT_DIR/$TIMER_UNIT" ]; then
+        echo systemd
+    elif [ -n "$(cron_entry)" ]; then
+        echo cron
     fi
 }
 
 schedule_text() {
-    command -v crontab >/dev/null 2>&1 || { echo "unavailable (cron not installed)"; return; }
-    local line
-    line=$(cron_entry)
-    if [ -z "$line" ]; then echo "off"; else describe_schedule "$line"; fi
+    case "$(schedule_kind)" in
+        off)    echo "off" ;;
+        hourly) echo "every hour" ;;
+        six)    echo "every 6 hours" ;;
+        daily)  echo "daily" ;;
+        watch)  echo "continuous" ;;
+        custom) echo "custom schedule" ;;
+    esac
 }
 
 # Quote a string for /bin/sh.
@@ -2322,23 +2881,47 @@ sh_quote() {
     printf "'%s'" "${1//\'/\'\\\'\'}"
 }
 
-# build_cron_entry hourly|six|daily
+# Quote a string for a systemd unit file.
+sd_quote() {
+    local v="${1//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "${v//%/%%}"
+}
+
+# PATH for background runs: wherever proton-drive, jq and bash live.
+background_path() {
+    local path_dirs="" dir tool
+    for tool in proton-drive jq bash inotifywait notify-send; do
+        command -v "$tool" >/dev/null 2>&1 || continue
+        dir=$(dirname "$(command -v "$tool")")
+        case ":$path_dirs:" in *":$dir:"*) ;; *) path_dirs="${path_dirs:+$path_dirs:}$dir" ;; esac
+    done
+    for dir in /usr/local/bin /usr/bin /bin; do
+        case ":$path_dirs:" in *":$dir:"*) ;; *) path_dirs="${path_dirs:+$path_dirs:}$dir" ;; esac
+    done
+    echo "$path_dirs"
+}
+
+# Environment variables to pass on to background runs.
+background_env() {
+    local var
+    echo "PATH=$(background_path)"
+    for var in XDG_CONFIG_HOME XDG_DATA_HOME PROTON_SYNC_CONFIG; do
+        [ -n "${!var:-}" ] && echo "$var=${!var}"
+    done
+}
+
 build_cron_entry() {
-    local when min=$((RANDOM % 60)) path_dirs="" dir cmd var
+    local when min=$((RANDOM % 60)) cmd e
     case "$1" in
         hourly) when="$min * * * *" ;;
         six)    when="$min */6 * * *" ;;
         daily)  when="$min 3 * * *" ;;
     esac
-    # cron's PATH is minimal: include wherever proton-drive, jq and bash live.
-    for dir in "$(dirname "$(command -v proton-drive)")" "$(dirname "$(command -v jq)")" \
-               "$(dirname "$(command -v bash)")" /usr/local/bin /usr/bin /bin; do
-        case ":$path_dirs:" in *":$dir:"*) ;; *) path_dirs="${path_dirs:+$path_dirs:}$dir" ;; esac
-    done
-    cmd="env $(sh_quote "PATH=$path_dirs")"
-    for var in XDG_CONFIG_HOME XDG_DATA_HOME PROTON_SYNC_CONFIG; do
-        [ -n "${!var:-}" ] && cmd+=" $(sh_quote "$var=${!var}")"
-    done
+    cmd="env"
+    while IFS= read -r e; do
+        cmd+=" $(sh_quote "$e")"
+    done < <(background_env)
     cmd+=" $(sh_quote "$(command -v bash)") $(sh_quote "$SCRIPT_PATH") --headless"
     cmd+=" >> $(sh_quote "$STATE_ROOT/cron.log") 2>&1"
     # cron treats a bare % as a line break.
@@ -2354,41 +2937,148 @@ install_cron_entry() {
     } | crontab -
 }
 
-schedule_menu() {
-    if ! command -v crontab >/dev/null 2>&1; then
-        ui_msgbox "Automatic Sync" "Automatic sync uses cron, but the crontab command isn't installed.
+write_systemd_units() {
+    local kind="$1" env_lines="" e min=$((RANDOM % 60)) cal
+    while IFS= read -r e; do
+        env_lines+="Environment=$(sd_quote "$e")"$'\n'
+    done < <(background_env)
+    mkdir -p "$UNIT_DIR" || return 1
+    if [ "$kind" = watch ]; then
+        cat > "$UNIT_DIR/$WATCH_UNIT" <<UNIT
+[Unit]
+Description=Proton Drive Sync (continuous)
+After=network-online.target
 
-Install cron (for example: sudo apt install cron), then come back here."
+[Service]
+Type=simple
+${env_lines}ExecStart=$(command -v bash) $(sd_quote "$SCRIPT_PATH") --watch
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target
+UNIT
         return
     fi
-    local choice line note=""
-    choice=$(ui_menu "Automatic Sync" "Syncs these folders in the background with your saved settings, even when this menu is closed.
+    case "$kind" in
+        hourly) cal="*-*-* *:$(printf %02d "$min"):00" ;;
+        six)    cal="*-*-* 00/6:$(printf %02d "$min"):00" ;;
+        daily)  cal="*-*-* 03:$(printf %02d "$min"):00" ;;
+    esac
+    cat > "$UNIT_DIR/$SERVICE_UNIT" <<UNIT
+[Unit]
+Description=Proton Drive Sync
+After=network-online.target
 
-Currently: $(schedule_text)" "Back" "" \
-        hourly "Every hour" \
-        six    "Every 6 hours" \
-        daily  "Once a day (around 3 AM)" \
-        off    "Turn off") || return
+[Service]
+Type=oneshot
+${env_lines}ExecStart=$(command -v bash) $(sd_quote "$SCRIPT_PATH") --headless
+UNIT
+    cat > "$UNIT_DIR/$TIMER_UNIT" <<UNIT
+[Unit]
+Description=Proton Drive Sync schedule
 
-    if [ "$choice" = off ]; then
-        if install_cron_entry ""; then
-            ui_msgbox "Automatic Sync" "Automatic sync is off."
+[Timer]
+OnCalendar=$cal
+# Catch up on a missed sync after the computer was asleep or off.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+remove_automatic_sync() {
+    if [ -f "$UNIT_DIR/$TIMER_UNIT" ] || [ -f "$UNIT_DIR/$WATCH_UNIT" ]; then
+        systemctl --user disable --now "$TIMER_UNIT" "$WATCH_UNIT" >/dev/null 2>&1
+        rm -f "$UNIT_DIR/$TIMER_UNIT" "$UNIT_DIR/$SERVICE_UNIT" "$UNIT_DIR/$WATCH_UNIT"
+        systemctl --user daemon-reload >/dev/null 2>&1
+    fi
+    if [ -n "$(cron_entry)" ]; then
+        install_cron_entry ""
+    fi
+    return 0
+}
+
+# apply_automatic_sync KIND — install automatic sync (off removes it).
+# Uses a systemd user timer when available (it catches up after sleep),
+# otherwise cron. Continuous sync needs systemd. Prints the backend used.
+apply_automatic_sync() {
+    local kind="$1"
+    remove_automatic_sync
+    [ "$kind" = off ] && return 0
+    if systemd_available; then
+        write_systemd_units "$kind" || return 1
+        systemctl --user daemon-reload >/dev/null 2>&1
+        if [ "$kind" = watch ]; then
+            systemctl --user enable --now "$WATCH_UNIT" >/dev/null 2>&1 || return 1
         else
-            ui_msgbox "Automatic Sync" "Couldn't update your crontab."
+            systemctl --user enable --now "$TIMER_UNIT" >/dev/null 2>&1 || return 1
         fi
+        echo systemd
+    elif [ "$kind" != watch ] && cron_available; then
+        install_cron_entry "$(build_cron_entry "$kind")" || return 1
+        echo cron
+    else
+        return 1
+    fi
+}
+
+schedule_menu() {
+    local have_systemd=false have_cron=false
+    systemd_available && have_systemd=true
+    cron_available && have_cron=true
+    if [ "$have_systemd" = false ] && [ "$have_cron" = false ]; then
+        ui_msgbox "Automatic Sync" "Automatic sync needs a systemd user session or cron, and neither is available.
+
+Install cron (for example: sudo apt install cron), or run \"$(basename "$SCRIPT_PATH") --watch\" yourself when you log in."
+        return
+    fi
+    local -a items=(
+        hourly "Every hour"
+        six    "Every 6 hours"
+        daily  "Once a day (around 3 AM)")
+    if [ "$have_systemd" = true ]; then
+        items+=(watch "Continuously (sync local changes within seconds)")
+    fi
+    items+=(off "Turn off")
+    local current backend choice used note=""
+    current=$(schedule_text); backend=$(schedule_backend)
+    [ -n "$backend" ] && current+=" (using $backend)"
+    choice=$(ui_menu "Automatic Sync" "Syncs all your folder pairs in the background with your saved settings, even when this menu is closed.
+
+Currently: $current" "Back" "$(schedule_kind)" "${items[@]}") || return
+
+    if [ "$choice" = watch ] && ! command -v inotifywait >/dev/null 2>&1; then
+        ui_msgbox "Automatic Sync" "Continuous sync needs inotifywait, which isn't installed.
+
+Install it (for example: sudo apt install inotify-tools), then try again."
+        return
+    fi
+    if ! used=$(apply_automatic_sync "$choice"); then
+        ui_msgbox "Automatic Sync" "Couldn't set up automatic sync. Check that systemd or cron is working for your user."
+        return
+    fi
+    if [ "$choice" = off ]; then
+        ui_msgbox "Automatic Sync" "Automatic sync is off."
         return
     fi
 
-    line=$(build_cron_entry "$choice")
-    if ! install_cron_entry "$line"; then
-        ui_msgbox "Automatic Sync" "Couldn't update your crontab."
-        return
+    local where="Each run's output is added to:
+  $STATE_ROOT/cron.log"
+    if [ "$used" = systemd ]; then
+        where="See each run's output with:
+  journalctl --user -u ${WATCH_UNIT%.service} -u ${SERVICE_UNIT%.service}"
+        if command -v loginctl >/dev/null 2>&1 \
+            && [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != yes ]; then
+            note+=$'\n\n'"It runs while you're logged in. To keep syncing after you log out, run: loginctl enable-linger"
+        fi
     fi
-    [ "$CONFLICT_STRATEGY" = ask ] && note=$'\n\n'"Conflicts are set to \"Ask me\", so automatic syncs skip files that changed on both sides until you sync from this menu. You can change that in Settings."
-    ui_msgbox "Automatic Sync" "Automatic sync is on: $(describe_schedule "$line").
+    [ "$choice" = watch ] && note+=$'\n\n'"Local changes are synced a few seconds after you stop editing. Proton Drive is checked every $WATCH_POLL_MINUTES minutes (change this in Settings)."
+    [ "$CONFLICT_STRATEGY" = ask ] && note+=$'\n\n'"Conflicts are set to \"Ask me\", so background syncs skip files that changed on both sides until you sync from this menu. You can change that in Settings."
+    ui_msgbox "Automatic Sync" "Automatic sync is on: $(schedule_text), using $used.
 
-Results show up under Last sync on the main menu and in Sync history. Each run's output is also added to:
-  $STATE_ROOT/cron.log
+Results show up under Last sync on the main menu and in Sync history. $where
 
 If a run would delete more files than your safety limit, it stops without changing anything; run a sync from this menu to confirm.$note"
 }
@@ -2398,10 +3088,13 @@ If a run would delete more files than your safety limit, it stops without changi
 # ============================================================
 
 menu_header() {
-    local account="logged in"
+    local account="logged in" n
     [ "$AUTH_STATE" = out ] && account="not logged in"
-    printf 'Local:      %s\n' "$(display_path "$LOCAL_DIR")"
-    printf 'Proton:     %s\n' "$REMOTE_DIR"
+    n=$(pair_count)
+    printf 'Folders:    %s' "$(pair_label "$CURRENT_PAIR")"
+    [ "$n" -gt 1 ] && printf '   (pair %d of %d)' "$((CURRENT_PAIR + 1))" "$n"
+    printf '\n'
+    printf 'Mode:       %s\n' "$(mode_label "$SYNC_MODE")"
     printf 'Last sync:  %s\n' "$(last_sync_text)"
     printf 'Account:    %s    Conflicts: %s' "$account" "$(conflict_label)"
     [ "$FORCE_DRY_RUN" = true ] && printf '\n\nPreview only: PROTON_SYNC_DRY_RUN is set, so syncs make no changes.'
@@ -2416,19 +3109,23 @@ main_menu() {
         else
             account_item="Log out of Proton Drive"
         fi
-        choice=$(ui_menu "Main Menu" "$(menu_header)" "Quit" "$choice" \
-            sync     "Sync now" \
-            preview  "Preview sync (see what would change)" \
-            restore  "Restore deleted files" \
-            logs     "Sync history and logs" \
-            settings "Settings" \
-            schedule "Automatic sync: $(schedule_text)" \
-            account  "$account_item") || break
+        local -a items=(sync "Sync now")
+        [ "$(pair_count)" -gt 1 ] && items+=(syncall "Sync all $(pair_count) folder pairs")
+        items+=(preview  "Preview sync (see what would change)"
+                restore  "Restore deleted files"
+                logs     "Sync history and logs"
+                pairs    "Folder pairs ($(pair_count))"
+                settings "Settings"
+                schedule "Automatic sync: $(schedule_text)"
+                account  "$account_item")
+        choice=$(ui_menu "Main Menu" "$(menu_header)" "Quit" "$choice" "${items[@]}") || break
         case "$choice" in
             sync)     run_sync_with_gauge false ;;
+            syncall)  sync_all_pairs ;;
             preview)  run_sync_with_gauge true ;;
             restore)  restore_menu ;;
             logs)     logs_menu ;;
+            pairs)    pairs_menu ;;
             settings) settings_menu ;;
             schedule) schedule_menu ;;
             account)  account_action ;;
@@ -2438,36 +3135,77 @@ main_menu() {
     echo "Goodbye."
 }
 
+# Sync every folder pair in turn, then show one combined result.
+sync_all_pairs() {
+    local i saved="$CURRENT_PAIR" n text=""
+    n=$(pair_count)
+    for i in "${!PAIR_LOCAL[@]}"; do
+        select_pair "$i"
+        SYNC_TITLE="Syncing $((i + 1)) of $n: $(pair_label "$i")"
+        LAST_RESULT="not run"
+        run_sync_with_gauge false quiet
+        text+="$((i + 1)). $(pair_label "$i")"$'\n'"   $LAST_RESULT"$'\n\n'
+    done
+    SYNC_TITLE=""
+    select_pair "$saved"
+    ui_msgbox "Sync All" "${text%$'\n\n'}"
+}
+
 # ============================================================
 # HEADLESS MODE
 # ============================================================
 
-# Non-interactive sync for cron/systemd: no dialogs, no prompts.
-# Exits 0 on success, 1 on any failure, transfer error or stop.
+# notify URGENCY TITLE BODY — desktop notification from background syncs.
+notify() {
+    [ "$NOTIFY" = off ] && return 0
+    [ "$DRY_RUN" = true ] && return 0
+    command -v notify-send >/dev/null 2>&1 || return 0
+    local bus
+    bus="/run/user/$(id -u)/bus"
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$bus" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$bus"
+    fi
+    notify-send -a "Proton Drive Sync" -u "$1" "$2" "$3" >/dev/null 2>&1 || true
+}
+
+rotate_cron_log() {
+    local f="$STATE_ROOT/cron.log"
+    if [ -f "$f" ] && [ "$(stat -c %s "$f")" -gt 1048576 ]; then
+        mv -f "$f" "$f.1"
+    fi
+}
+
+# Sync the current folder pair without dialogs or prompts.
+# Returns 0 on success, 1 on any failure, error or stop, 3 if another
+# sync holds the lock.
 headless_sync() {
-    echo "Proton Drive Sync (headless) $(date '+%Y-%m-%d %H:%M')"
-    echo "Local:   $LOCAL_DIR"
-    echo "Proton:  $REMOTE_DIR"
+    local label
+    label=$(pair_label "$CURRENT_PAIR")
+    echo "== $label ($(mode_label "$SYNC_MODE")) $(date '+%Y-%m-%d %H:%M')"
     [ "$DRY_RUN" = true ] && echo "Mode:    DRY RUN (no changes will be made)"
-    echo
 
     if ! acquire_lock; then
         echo "ERROR: Another sync is already running (lock: $LOCK_FILE)" >&2
         echo "If you are sure no sync is running, remove it manually:" >&2
         echo "  rmdir '$LOCK_FILE'" >&2
-        return 1
+        return 3
     fi
 
     if ! is_authenticated; then
+        release_lock
         record_result "Stopped: not logged in to Proton Drive"
+        notify critical "Proton Drive Sync stopped" "Not logged in to Proton Drive. Run: proton-drive auth login"
         echo "ERROR: Cannot access $REMOTE_DIR — are you logged in?" >&2
         echo "Run: proton-drive auth login" >&2
         return 1
     fi
 
     # Conflicts can't be asked about without a terminal; leave them unresolved.
-    [ "$CONFLICT_STRATEGY" = "ask" ] && CONFLICT_STRATEGY=skip
+    local strategy="$CONFLICT_STRATEGY"
+    [ "$strategy" = "ask" ] && CONFLICT_STRATEGY=skip
 
+    LOG_FILE="$LOG_DIR/sync-$(date +%Y%m%d-%H%M%S).log"
+    LOCAL_TRASH="$TRASH_DIR/$(date +%Y%m%d-%H%M%S)"
     local conflict_dump="$STATE_DIR/conflicts.tmp" rc=0
     : > "$conflict_dump"
 
@@ -2475,12 +3213,15 @@ headless_sync() {
     sync_engine "$conflict_dump" >/dev/null || rc=$?
     if [ "$rc" -ne 0 ]; then
         rm -f "$conflict_dump" "$NEW_SNAPSHOT" "$LOCAL_MANIFEST" "$REMOTE_MANIFEST"
+        release_lock
+        CONFLICT_STRATEGY="$strategy"
         echo "ERROR: $ABORT_REASON" >&2
         echo "No changes were made." >&2
         if [ "$rc" -eq 2 ]; then
             local n
             n=$(wc -l < "$PENDING_DELETES")
             record_result "Stopped: $n deletions need confirmation"
+            notify critical "Proton Drive Sync stopped" "$label: $n files would be deleted. Open the menu and choose Sync now to review them."
             echo >&2
             echo "Files that would be deleted:" >&2
             head -20 "$PENDING_DELETES" | sed 's/^/  /' >&2
@@ -2490,6 +3231,7 @@ headless_sync() {
             echo "  $SCRIPT_PATH --headless --allow-deletes" >&2
         else
             record_result "Stopped: $ABORT_REASON"
+            notify critical "Proton Drive Sync stopped" "$label: $ABORT_REASON"
         fi
         echo "Log: $LOG_FILE" >&2
         return 1
@@ -2504,35 +3246,252 @@ headless_sync() {
     finalize_snapshot
     release_lock
 
+    local result
+    result=$(result_text)
     if [ "$DRY_RUN" = true ]; then
-        record_result "Preview: $(result_text)"
+        record_result "Preview: $result"
         format_plan
     else
-        record_result "$(result_text)"
+        record_result "$result"
         echo "=== Sync Summary ==="
         sync_summary | sed 's/^/  /'
         if [ "$(plan_count failed)" -gt 0 ]; then
             echo "Problems (retried on the next sync):"
             grep "^failed"$'\t' "$PLAN_FILE" | cut -f2- | sed 's/^/  /'
         fi
-        [ "$CONFLICT_STRATEGY" = "skip" ] && [ "$COUNT_CONFLICTS" -gt 0 ] && \
-            echo "  ($COUNT_CONFLICTS conflict(s) left unresolved; set PROTON_SYNC_CONFLICT or sync from the menu to resolve)"
+        if [ "$CONFLICT_STRATEGY" = "skip" ] && [ "$COUNT_CONFLICTS" -gt 0 ]; then
+            echo "  ($COUNT_CONFLICTS conflict(s) left unresolved; sync from the menu to resolve them)"
+        fi
+        if [ "$COUNT_ERRORS" -gt 0 ]; then
+            notify normal "Proton Drive Sync had problems" "$label: $result"
+        elif [ "$CONFLICT_STRATEGY" = "skip" ] && [ "$COUNT_CONFLICTS" -gt 0 ]; then
+            notify normal "Proton Drive Sync: conflicts" "$label: $COUNT_CONFLICTS file(s) changed on both sides. Open the menu and choose Sync now to resolve them."
+        elif [ "$NOTIFY" = changes ] && [ "$result" != "no changes, no errors" ]; then
+            notify low "Proton Drive synced" "$label: $result"
+        fi
     fi
+    CONFLICT_STRATEGY="$strategy"
     echo "Log: $LOG_FILE"
 
     [ "$COUNT_ERRORS" -eq 0 ]
 }
 
+# Sync the chosen pairs (all by default). Returns the worst result:
+# 0 ok, 1 a pair failed, 3 a pair was skipped because another sync ran.
+headless_run() {
+    local i rc worst=0
+    local -a pairs=("${!PAIR_LOCAL[@]}")
+    [ -n "$ONLY_PAIR" ] && pairs=("$ONLY_PAIR")
+    for i in "${pairs[@]}"; do
+        select_pair "$i"
+        rc=0
+        headless_sync || rc=$?
+        echo
+        if [ "$rc" -eq 1 ] || { [ "$rc" -eq 3 ] && [ "$worst" -eq 0 ]; }; then
+            worst="$rc"
+        fi
+    done
+    return "$worst"
+}
+
+# event_needs_sync PATH — 0 if PATH changed in a way the last sync hasn't
+# recorded (the user changed something), 1 if it's the sync's own doing or
+# irrelevant (excluded names, download-only folders, folders).
+event_needs_sync() {
+    local path="$1" i rel snap fp
+    for i in "${!PAIR_LOCAL[@]}"; do
+        [ "${PAIR_MODE[$i]}" = download ] && continue
+        case "$path" in "${PAIR_LOCAL[$i]}"/*) ;; *) continue ;; esac
+        rel="${path#"${PAIR_LOCAL[$i]}"/}"
+        is_excluded "$rel" && return 1
+        snap="$(pair_state_dir "${PAIR_LOCAL[$i]}" "${PAIR_REMOTE[$i]}")/snapshot"
+        if [ -d "$path" ]; then
+            return 1
+        elif [ -f "$path" ]; then
+            fp=$(get_local_fingerprint "$path")
+            grep -qF "file${SEP}${rel}${SEP}${fp}${SEP}" "$snap" 2>/dev/null && return 1
+            return 0
+        else
+            # Gone: a change only if the last sync recorded it as present.
+            grep -qF "file${SEP}${rel}${SEP}" "$snap" 2>/dev/null
+            return
+        fi
+    done
+    return 1
+}
+
+# Continuous sync: sync a few seconds after local changes stop, and check
+# Proton for changes every WATCH_POLL_MINUTES. Runs until stopped.
+watch_mode() {
+    if ! command -v inotifywait >/dev/null 2>&1; then
+        echo "ERROR: continuous sync needs inotifywait (for example: sudo apt install inotify-tools)" >&2
+        return 1
+    fi
+    local -a dirs=()
+    local i
+    for i in "${!PAIR_LOCAL[@]}"; do
+        [ "${PAIR_MODE[$i]}" = download ] && continue
+        [ -d "${PAIR_LOCAL[$i]}" ] && dirs+=("${PAIR_LOCAL[$i]}")
+    done
+
+    local config_stamp
+    WATCH_FIFO=$(mktemp -u "$STATE_ROOT/watch.XXXXXX")
+    mkfifo "$WATCH_FIFO" || return 1
+    exec 3<>"$WATCH_FIFO"
+    if [ "${#dirs[@]}" -gt 0 ]; then
+        inotifywait -m -r -q -e close_write,create,delete,move,attrib --format '%w%f' \
+            "${dirs[@]}" >&3 2>>"$STATE_ROOT/watch.log" &
+        WATCH_PID=$!
+    fi
+    trap 'exit 0' TERM INT
+    config_stamp=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null || echo 0)
+
+    echo "Continuous sync started $(date '+%Y-%m-%d %H:%M'): watching ${#dirs[@]} folder(s), checking Proton every $WATCH_POLL_MINUTES min."
+    local poll=$((WATCH_POLL_MINUTES * 60)) next_poll now remaining path rc pending=false reason
+    headless_run
+    next_poll=$(( $(date +%s) + poll ))
+
+    while true; do
+        if [ "$pending" = false ]; then
+            now=$(date +%s); remaining=$((next_poll - now)); ((remaining < 1)) && remaining=1
+            rc=0
+            read -r -t "$remaining" -u 3 path || rc=$?
+            if [ "$rc" -eq 0 ]; then
+                event_needs_sync "$path" || continue
+                reason="local changes"
+            elif [ "$rc" -gt 128 ]; then
+                reason="checking Proton Drive"
+            else
+                echo "ERROR: the file watcher stopped (see $STATE_ROOT/watch.log)" >&2
+                return 1
+            fi
+        fi
+        if [ -n "$WATCH_PID" ] && ! kill -0 "$WATCH_PID" 2>/dev/null; then
+            echo "ERROR: the file watcher stopped (see $STATE_ROOT/watch.log)" >&2
+            return 1
+        fi
+        # Wait until changes settle (at most a minute).
+        local settle_end=$(( $(date +%s) + 60 ))
+        while [ "$(date +%s)" -lt "$settle_end" ] && read -r -t "$WATCH_DELAY_SECONDS" -u 3 path; do :; done
+
+        # Pick up changed settings or folder pairs by restarting.
+        if [ "$(stat -c %Y "$CONFIG_FILE" 2>/dev/null || echo 0)" != "$config_stamp" ]; then
+            echo "Settings changed; restarting."
+            cleanup_on_exit
+            exec bash "$SCRIPT_PATH" --watch
+        fi
+
+        echo "=== $(date '+%Y-%m-%d %H:%M:%S'): syncing ($reason)"
+        rc=0
+        headless_run || rc=$?
+        pending=false
+        next_poll=$(( $(date +%s) + poll ))
+        if [ "$rc" -eq 3 ]; then
+            # Another sync was running; try again shortly.
+            pending=true; reason="retry"
+            sleep 30
+            continue
+        fi
+        # Changes made while syncing (other than the sync's own) need another run.
+        while read -r -t 1 -u 3 path; do
+            event_needs_sync "$path" && { pending=true; reason="changes during the last sync"; }
+        done
+    done
+}
+
+# --status: what's configured and how the last syncs went (no network).
+print_status() {
+    local i
+    echo "Proton Drive Sync"
+    echo "Settings:        $CONFIG_FILE"
+    echo "Automatic sync:  $(schedule_text)$( [ -n "$(schedule_backend)" ] && echo " ($(schedule_backend))")"
+    if [ -d "$LOCK_FILE" ] && ! lock_is_stale; then
+        echo "Sync running:    yes"
+    fi
+    echo
+    for i in "${!PAIR_LOCAL[@]}"; do
+        echo "$((i + 1)). $(pair_label "$i")"
+        echo "   Mode:       $(mode_label "${PAIR_MODE[$i]}")"
+        echo "   Last sync:  $(pair_last_sync "$i")"
+    done
+}
+
+# ============================================================
+# INSTALL / UNINSTALL
+# ============================================================
+
+INSTALL_PATH="$HOME/.local/bin/proton-drive-sync"
+DESKTOP_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/applications/proton-drive-sync.desktop"
+
+install_script() {
+    local kind
+    mkdir -p "$(dirname "$INSTALL_PATH")" "$(dirname "$DESKTOP_FILE")" || return 1
+    if [ "$SCRIPT_PATH" != "$INSTALL_PATH" ]; then
+        cp -f "$SCRIPT_PATH" "$INSTALL_PATH.tmp" && chmod 755 "$INSTALL_PATH.tmp" \
+            && mv -f "$INSTALL_PATH.tmp" "$INSTALL_PATH" || return 1
+    fi
+    cat > "$DESKTOP_FILE" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Proton Drive Sync
+Comment=Sync folders with Proton Drive
+Exec="$INSTALL_PATH"
+Terminal=true
+Icon=folder-remote
+Categories=Utility;Network;FileTransfer;
+DESKTOP
+    echo "Installed: $INSTALL_PATH"
+    echo "Launcher:  $DESKTOP_FILE"
+
+    # Point automatic sync at the installed copy.
+    kind=$(schedule_kind)
+    case "$kind" in
+        off|custom) ;;
+        *)
+            SCRIPT_PATH="$INSTALL_PATH"
+            if apply_automatic_sync "$kind" >/dev/null; then
+                echo "Automatic sync ($(schedule_text)) now runs the installed copy."
+            else
+                echo "WARNING: couldn't update automatic sync; set it up again from the menu." >&2
+            fi
+            ;;
+    esac
+    case ":$PATH:" in
+        *":$(dirname "$INSTALL_PATH"):"*) echo "Run it with: proton-drive-sync" ;;
+        *) echo "Note: $(dirname "$INSTALL_PATH") isn't in your PATH; run it as $INSTALL_PATH" ;;
+    esac
+}
+
+uninstall_script() {
+    local kind
+    kind=$(schedule_kind)
+    if [ "$kind" != off ] && grep -qsF "$INSTALL_PATH" "$UNIT_DIR/$SERVICE_UNIT" "$UNIT_DIR/$WATCH_UNIT" \
+        <(cron_entry); then
+        remove_automatic_sync
+        echo "Turned off automatic sync (it used the installed copy)."
+    fi
+    rm -f "$INSTALL_PATH" "$DESKTOP_FILE"
+    echo "Removed $INSTALL_PATH and the launcher."
+    echo "Your settings ($CONFIG_FILE) and sync history ($STATE_ROOT) were kept."
+}
+
 usage() {
     cat <<USAGE
-Usage: $(basename "$0") [--headless] [--dry-run] [--allow-deletes] [--help]
+Usage: $(basename "$0") [OPTIONS]
 
   (no options)     Start the interactive menu.
-  --headless       Run one sync without the menu (for cron/systemd) and exit.
-                   Also used automatically when there is no terminal.
+  --headless       Sync all folder pairs without the menu (for cron/systemd)
+                   and exit. Also used automatically when there is no terminal.
+  --pair N         With --headless or --dry-run: sync only folder pair N.
   --dry-run        Preview only; make no changes (same as PROTON_SYNC_DRY_RUN=true).
   --allow-deletes  Don't stop when a sync would delete more files than the
                    safety limit set in Settings.
+  --watch          Continuous sync: sync local changes within seconds and
+                   check Proton regularly. Runs until stopped.
+  --status         Show folder pairs, last results and automatic sync, then exit.
+  --install        Copy this script to ~/.local/bin/proton-drive-sync and add
+                   a desktop launcher.
+  --uninstall      Remove the installed copy and launcher (keeps your settings).
   --help           Show this help.
 
 Settings are read from $CONFIG_FILE
@@ -2544,11 +3503,23 @@ USAGE
 # ============================================================
 
 HEADLESS=false
+ACTION=menu
+ONLY_PAIR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --headless|--sync) HEADLESS=true ;;
         --dry-run) FORCE_DRY_RUN=true; DRY_RUN=true ;;
         --allow-deletes) ALLOW_DELETES=true ;;
+        --pair|--pair=*)
+            if [ "$1" = --pair ]; then shift; n="${1:-}"; else n="${1#--pair=}"; fi
+            if ! is_number "$n" || [ "$n" -lt 1 ]; then
+                echo "--pair needs a folder pair number (see --status)" >&2; exit 2
+            fi
+            ONLY_PAIR=$((n - 1)) ;;
+        --watch) ACTION=watch ;;
+        --status) ACTION=status ;;
+        --install) ACTION=install ;;
+        --uninstall) ACTION=uninstall ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -2561,7 +3532,18 @@ remember_saved_settings
 apply_env_overrides
 validate_settings
 mkdir -p "$STATE_ROOT"
-init_state_paths
+
+if [ -n "$ONLY_PAIR" ] && [ "$ONLY_PAIR" -ge "$(pair_count)" ]; then
+    echo "There is no folder pair $((ONLY_PAIR + 1)); there are $(pair_count) (see --status)." >&2
+    exit 2
+fi
+select_pair "${ONLY_PAIR:-$CURRENT_PAIR}"
+
+case "$ACTION" in
+    status)    print_status; exit 0 ;;
+    install)   install_script; exit $? ;;
+    uninstall) uninstall_script; exit $? ;;
+esac
 
 # No terminal (cron, systemd, piped) means the menu can't work.
 if [ ! -t 0 ] || [ ! -t 1 ]; then
@@ -2578,9 +3560,17 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ "$HEADLESS" = true ]; then
-    headless_sync
+if [ "$ACTION" = watch ]; then
+    watch_mode
     exit $?
+fi
+
+if [ "$HEADLESS" = true ]; then
+    rotate_cron_log
+    rc=0
+    headless_run || rc=$?
+    [ "$rc" -eq 0 ] || exit 1
+    exit 0
 fi
 
 if ! find_ui_tool; then
