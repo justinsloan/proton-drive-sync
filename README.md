@@ -19,14 +19,17 @@ A two-way file synchronization tool for [Proton Drive](https://proton.me/drive),
 - ⚔️ **Conflict resolution** — keep local, keep Proton, keep both, or skip, with a line-by-line diff for text files
 - 🛑 **Large-deletion safety** — asks before deleting more than 50 files or 25% of your files (both adjustable); automatic syncs stop instead
 - 🗑️ **Recoverable deletions** — local deletions go to a trash you can restore from in the menu; remote deletions use Proton's trash
+- 📁 **Several folder pairs** — sync any number of local/Proton folder pairs, each with its own history, logs and trash
+- ↔️ **Sync modes** — two-way, backup to Proton (upload only), or download from Proton only, per folder pair
+- 🙈 **Selective sync** — skip chosen subfolders per folder pair, and optionally files over a size limit
 - ⚙️ **Saved settings** — folders, conflict handling, exclusions and more are saved and used by automatic syncs too
-- 📁 **Separate history per folder pair** — switching folders never mixes up sync histories
-- ⏰ **Automatic sync** — set up an hourly, 6-hourly or daily cron job from the menu
+- ⏰ **Automatic sync** — hourly, 6-hourly or daily (systemd timer or cron), or continuous: local changes are synced within seconds
+- 🔔 **Notifications** — optional desktop notifications when a background sync needs attention
 - ⚡ **Parallel transfers** — uploads, downloads and remote folder listings run several at a time (4 by default)
 - 🔁 **Automatic retries** — failed transfers retry with exponential backoff
 - 🚫 **Exclude patterns** — skip temp files, VCS directories, OS junk, etc.
 - 📊 **Progress & history** — progress bar, per-sync summary, and a browsable history of past syncs
-- 🔒 **Lock file** — prevents concurrent sync runs from corrupting state
+- 🔒 **Lock file** — prevents concurrent sync runs from corrupting state, and clears itself if a sync crashed
 - 🛡️ **Safety guards** — stops without changing anything if a remote folder can't be listed, or if the remote listing is empty while sync history exists
 
 ---
@@ -39,7 +42,9 @@ A two-way file synchronization tool for [Proton Drive](https://proton.me/drive),
 | [`proton-drive`](https://proton.me/drive) CLI | Talks to Proton Drive | See Proton's docs |
 | `jq` | Parses JSON output | `apt install jq` / `dnf install jq` |
 | `dialog` or `whiptail` | Menu interface (not needed for `--headless`) | `apt install dialog` / `dnf install dialog` (`whiptail` is preinstalled on Debian/Ubuntu) |
-| `cron` (optional) | Automatic sync | `apt install cron` |
+| systemd or `cron` (optional) | Automatic sync | Usually preinstalled; `apt install cron` |
+| `inotify-tools` (optional) | Continuous sync | `apt install inotify-tools` / `dnf install inotify-tools` |
+| `notify-send` (optional) | Desktop notifications | `apt install libnotify-bin` / `dnf install libnotify` |
 | Core utils | `find`, `stat`, `date`, `sha256sum`, `diff`, etc. | Preinstalled |
 
 ---
@@ -61,27 +66,48 @@ Install missing dependencies (Debian/Ubuntu example):
 sudo apt install dialog jq
 ```
 
+Optionally install it for your user, which copies it to `~/.local/bin/proton-drive-sync` and adds a "Proton Drive Sync" launcher to your desktop's app menu:
+
+```bash
+./proton-sync-tui.sh --install      # run again after updating the repo
+proton-drive-sync --uninstall       # removes the copy and launcher; keeps settings and history
+```
+
+If automatic sync is on, `--install` points it at the installed copy.
+
 ---
 
 ## Configuration
 
-Open **Settings** from the main menu. Changes are saved immediately to `~/.config/proton-sync/config` (or `$XDG_CONFIG_HOME/proton-sync/config`) and are used by both the menu and automatic syncs:
+Folders are set up under **Folder pairs** in the main menu, and everything else under **Settings**. Changes are saved immediately to `~/.config/proton-sync/config` (or `$XDG_CONFIG_HOME/proton-sync/config`) and are used by both the menu and automatic syncs.
+
+Each **folder pair** has:
+
+| Option | Default |
+|---|---|
+| Local folder | `~/Proton Drive/root` (for the first pair) |
+| Proton folder | `/my-files` (for the first pair) |
+| Sync mode | Two-way |
+| Skipped folders | none |
+
+**Settings** apply to all pairs:
 
 | Setting | Default |
 |---|---|
-| Local folder | `~/Proton Drive/root` |
-| Proton folder | `/my-files` |
-| Conflicts | Ask me (automatic syncs skip conflicting files) |
+| Conflicts | Ask me (background syncs skip conflicting files) |
 | Parallel transfers | 4 |
 | Confirm deletions | more than 50 files or more than 25% of files |
+| Skip files larger than | no limit |
 | Excluded names | `*.tmp *.swp *.partial .DS_Store Thumbs.db .git .proton-sync` |
+| Notifications | off |
+| Continuous sync checks Proton every | 15 minutes |
 | Keep local trash | 30 days (0 = until you delete it) |
 | Keep logs | 90 days (0 = forever) |
 | Debug logging | off |
 
-The settings file is plain Bash (`KEY=value` lines), so you can also edit it by hand. The defaults live at the top of the script.
+The settings file is plain Bash (`KEY=value` lines), so you can also edit it by hand; `WATCH_DELAY_SECONDS` (default 5) sets how long continuous sync waits after your last change. The defaults live at the top of the script. A settings file from an earlier version (with `LOCAL_DIR` / `REMOTE_DIR`) becomes the first folder pair.
 
-Exclude patterns are matched against every part of a path, so `.git` skips `.git` folders at any depth.
+Excluded names are matched against every part of a path, so `.git` skips `.git` folders at any depth. Skipped folders are paths within one pair, such as `Photos/2019`.
 
 ---
 
@@ -95,23 +121,33 @@ On launch, the script checks your Proton Drive login. If you're not logged in, i
 
 ### Main Menu
 
-The top of the menu shows your folders, when the last sync ran and how it went, whether you're logged in, and how conflicts are handled.
+The top of the menu shows the folder pair it's working with (the arrow shows the direction: `<->` two-way, `->` backup, `<-` download), when it was last synced and how that went, whether you're logged in, and how conflicts are handled.
 
 | Option | Description |
 |---|---|
-| **Sync now** | Perform a full two-way sync, then show a summary (with any failed files) and offer to open the log |
-| **Preview sync** | List every file that would be uploaded, downloaded, moved or deleted, without changing anything, then offer to run that sync |
+| **Sync now** | Sync the current folder pair, then show a summary (with any failed files) and offer to open the log |
+| **Sync all folder pairs** | Shown when you have more than one pair: sync each in turn and show all results |
+| **Preview sync** | List every file that would be uploaded, downloaded, moved or deleted (and what's not synced), without changing anything, then offer to run that sync |
 | **Restore deleted files** | Browse files that syncs deleted locally, and restore all or selected files to their original place |
 | **Sync history and logs** | Past syncs with their results; view each log in full or just its changes and problems |
-| **Settings** | Folders, conflict handling, deletion safety limit, exclusions, retention, debug logging |
-| **Automatic sync** | Turn a cron job on (hourly, every 6 hours, daily) or off |
+| **Folder pairs** | Add, change or remove folder pairs; set each pair's sync mode and skipped folders; choose which pair the menu uses |
+| **Settings** | Conflict handling, deletion safety limit, size limit, exclusions, notifications, retention, debug logging |
+| **Automatic sync** | Every hour, every 6 hours, daily, continuously, or off |
 | **Log in / Log out** | Manage your Proton Drive login |
 
 Exit with the **Quit** button (or `Esc`).
 
-### Changing folders
+### Folder pairs and sync modes
 
-Each local/Proton folder pair keeps its own sync history, logs and trash. When you switch to a pair you haven't synced before, the first sync copies files that exist on only one side to the other side and doesn't delete anything. Use **Preview sync** first to check what it will do. Switching back to an earlier pair picks up its history where you left off.
+Each local/Proton folder pair keeps its own sync history, logs and trash. When you add a pair, or change a pair's folders to ones you haven't synced together before, the first sync copies files that exist on only one side to the other side and doesn't delete anything. Use **Preview sync** first to check what it will do. The app warns you if a new pair overlaps another one, since the same files would then be synced twice.
+
+| Mode | What it does |
+|---|---|
+| **Two-way** | Changes, moves and deletions go both ways; conflicts follow your conflict setting |
+| **Backup to Proton** | Uploads new and changed local files. Never deletes anything on Proton and never downloads; files that go missing on Proton are uploaded again. If a file changed on both sides, the local version wins |
+| **Download from Proton** | Downloads new and changed Proton files. Never uploads and never deletes local files; files that go missing locally are downloaded again. If a file changed on both sides, the Proton version wins and the local copy goes to the local trash |
+
+Files that aren't synced (Proton Docs, which can't be downloaded, and files over the size limit) are listed under **Not synced** in the preview. A file over the size limit is never deleted because of it. The preview also notes new files whose names can't be used on Windows (such as `report?.txt` or `CON.txt`), in case you open the same Proton folder there.
 
 ### Large deletions
 
@@ -119,21 +155,30 @@ If a sync would delete more files than your limit (Settings → Confirm deletion
 
 ### Headless Mode (cron / systemd)
 
-Run a single sync without the menu, then exit. This mode doesn't need `dialog` and never prompts:
+Sync without the menu, then exit. This mode doesn't need `dialog` and never prompts:
 
 ```bash
-./proton-sync-tui.sh --headless                  # real sync
+./proton-sync-tui.sh --headless                  # sync all folder pairs
+./proton-sync-tui.sh --headless --pair 2         # only folder pair 2
 ./proton-sync-tui.sh --headless --dry-run        # preview: prints the planned changes
 ./proton-sync-tui.sh --headless --allow-deletes  # skip the large-deletion stop
+./proton-sync-tui.sh --status                    # folder pairs, last results, automatic sync
 ```
 
-The script also switches to headless mode automatically when there is no terminal (cron, systemd, pipes). It uses your saved settings, prints a summary, and exits `1` if the sync hit errors, stopped for safety, wasn't logged in, or another sync held the lock. Conflicts are skipped when the conflict setting is "Ask me", because nobody is there to ask. Log in once interactively (`proton-drive auth login`) before scheduling it.
+The script also switches to headless mode automatically when there is no terminal (cron, systemd, pipes). It uses your saved settings, prints a summary for each folder pair, and exits `1` if any pair hit errors, stopped for safety, wasn't logged in, or another sync held the lock. Conflicts are skipped when the conflict setting is "Ask me", because nobody is there to ask. Log in once interactively (`proton-drive auth login`) before scheduling it.
 
 ### Automatic sync
 
-The easiest way is **Automatic sync** in the main menu. It adds one line to your crontab (marked `# proton-drive-sync`) that runs `--headless` with the right `PATH`, and it leaves your other cron jobs alone. Results show up under **Last sync** and in **Sync history**, and each run's output is appended to `~/.local/share/proton-sync/cron.log`.
+Choose **Automatic sync** in the main menu. It syncs all folder pairs in the background, using:
 
-To set it up by hand instead:
+- a **systemd user timer** when your system has one. Timers catch up on a missed run after the computer was asleep or off. See the output with `journalctl --user -u proton-drive-sync`.
+- otherwise **cron**, with one line in your crontab (marked `# proton-drive-sync`; your other cron jobs are left alone). Output is appended to `~/.local/share/proton-sync/cron.log`, which is rotated at 1 MB.
+
+The **Continuously** option (systemd and `inotify-tools` needed) runs `--watch` as a user service. Local changes are synced a few seconds after you stop editing, and Proton Drive is checked for changes every 15 minutes (Settings → Continuous sync checks Proton every). Download-only folder pairs are only checked on that schedule. You can also run `./proton-sync-tui.sh --watch` yourself, for example from your desktop's autostart; it restarts itself when you change settings.
+
+Results show up under **Last sync** and in **Sync history**. With **Notifications** turned on in Settings, background syncs also send a desktop notification when something needs attention (errors, a stop, or skipped conflicts), or after every sync that changed files.
+
+To set up cron by hand instead:
 
 1. Log in once and run a first sync to check that everything works:
 
@@ -161,9 +206,10 @@ To set it up by hand instead:
 Notes:
 
 - **Conflicts:** with the default "Ask me" setting, automatic syncs skip files that changed on both sides until you sync from the menu. To resolve them automatically, pick another option in Settings → Conflicts. "Keep both" is the safest: the local version wins under the original name on both sides, and the Proton version is kept beside it as a `.remote` copy.
-- **`XDG_CONFIG_HOME` / `XDG_DATA_HOME`:** if your shell sets these, the menu's Automatic sync option passes them to cron. When editing the crontab by hand, set them there too.
-- **"Not logged in" only under cron:** if a manual run works but cron reports `Cannot access ... are you logged in?`, `proton-drive` probably can't reach its stored login outside your desktop session.
-- **Stale lock:** if a sync is killed outright (for example, by a power loss), the lock stays behind and every later run exits with "Another sync is already running". Delete `~/.local/share/proton-sync/sync.lock` to clear it.
+- **Logged out:** systemd user timers and services run while you're logged in. To keep syncing after you log out, run `loginctl enable-linger`.
+- **`XDG_CONFIG_HOME` / `XDG_DATA_HOME`:** if your shell sets these, the menu's Automatic sync option passes them on. When editing the crontab by hand, set them there too.
+- **"Not logged in" only in the background:** if a manual run works but background runs report `Cannot access ... are you logged in?`, `proton-drive` probably can't reach its stored login outside your desktop session.
+- **Crashes:** if a sync is killed outright (for example, by a power loss), the next run notices that the sync holding the lock is gone and continues.
 
 ### Environment Variables
 
@@ -176,7 +222,7 @@ PROTON_SYNC_DRY_RUN=true ./proton-sync-tui.sh
 # Conflict handling (ask | local | remote | both | skip)
 PROTON_SYNC_CONFLICT=local ./proton-sync-tui.sh
 
-# Folders
+# Folders (replaces your folder pairs for this run)
 PROTON_SYNC_LOCAL_DIR=~/Work PROTON_SYNC_REMOTE_DIR=/work ./proton-sync-tui.sh
 
 # Number of transfers / folder listings to run at once
@@ -225,12 +271,13 @@ The script maintains a **snapshot** of the last known state of every file (size 
 
 ## State & Data Locations
 
-Settings live in `~/.config/proton-sync/config`. Everything else lives under `$XDG_DATA_HOME/proton-sync` (default `~/.local/share/proton-sync`), with a separate folder for each local/Proton folder pair:
+Settings live in `~/.config/proton-sync/config`; systemd units for automatic sync in `~/.config/systemd/user/proton-drive-sync*`. Everything else lives under `$XDG_DATA_HOME/proton-sync` (default `~/.local/share/proton-sync`), with a separate folder for each local/Proton folder pair:
 
 ```
 ~/.local/share/proton-sync/
-├── sync.lock              # Present only while a sync is running
-├── cron.log               # Output of automatic syncs
+├── sync.lock/             # Present only while a sync is running (holds its PID)
+├── cron.log               # Output of cron-based automatic syncs (older output in cron.log.1)
+├── watch.log              # Errors from the continuous-sync file watcher
 └── pairs/<id>/            # One per folder pair
     ├── folders            # Which local and Proton folders this is
     ├── snapshot           # Last-sync state (source of truth)
@@ -275,10 +322,7 @@ Choose a default in Settings → Conflicts, or with `PROTON_SYNC_CONFLICT`.
 ## Troubleshooting
 
 **"Another sync is already running"**
-A previous run may have crashed. Remove the stale lock:
-```bash
-rmdir ~/.local/share/proton-sync/sync.lock
-```
+Another sync really is running (for example, automatic sync), so wait for it to finish. A lock left by a sync that crashed is removed automatically. `--status` shows whether a sync is running.
 
 **Everything shows as re-downloading**
 Your snapshot may be out of date or missing. Check the log in **Sync history**, or reset the baseline for the current folders (⚠️ treats current state as truth). Settings → *Where settings, logs and trash are stored* shows the folder that holds the `snapshot` file.
@@ -288,6 +332,12 @@ Something is changing the local modification time between runs (e.g., an editor,
 
 **Automatic sync stopped with "deletions need confirmation"**
 A sync would have deleted more files than your safety limit. Open the menu and choose **Sync now** to review the list and confirm, or raise the limit in Settings → Confirm deletions.
+
+**Continuous sync stops with "the file watcher stopped"**
+Very large folders can exceed the system's limit on watched folders; `~/.local/share/proton-sync/watch.log` will say so. Raise the limit, for example with `echo fs.inotify.max_user_watches=524288 | sudo tee /etc/sysctl.d/90-inotify.conf && sudo sysctl --system`, or use a timed schedule instead.
+
+**No notifications from background syncs**
+Check that Settings → Notifications is on and that `notify-send` is installed. Notifications appear only while you're logged in to a desktop session.
 
 **Recovering a deleted file**
 Use **Restore deleted files** in the main menu. Files deleted on Proton Drive are in Proton's own trash.
