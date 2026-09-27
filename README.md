@@ -19,12 +19,13 @@ A two-way file synchronization tool for [Proton Drive](https://proton.me/drive),
 - 🗑️ **Recoverable deletions** — local deletions go to a timestamped trash folder (auto-purged after 30 days); remote deletions use Proton's trash
 - 🔒 **Lock file** — prevents concurrent sync runs from corrupting state
 - 🔁 **Automatic retries** — failed transfers retry with exponential backoff
+- ⚡ **Parallel transfers** — uploads, downloads and remote folder listings run several at a time (4 by default)
 - 🚫 **Exclude patterns** — skip temp files, VCS directories, OS junk, etc.
 - 🧪 **Dry-run mode** — preview all actions without making changes
 - 📊 **Progress gauge & summary** — live progress bar and a per-run summary report
 - 📝 **Logging** — detailed, timestamped logs for every run
 - 🔑 **Auth handling** — verifies authentication at startup and guides you through login
-- 🛡️ **Safety guards** — refuses to run if the remote listing is empty while sync history exists (prevents mass deletion)
+- 🛡️ **Safety guards** — stops without changing anything if a remote folder can't be listed, or if the remote listing is empty while sync history exists (prevents mass deletion)
 
 ---
 
@@ -170,6 +171,10 @@ PROTON_SYNC_CONFLICT=local ./proton-sync-tui.sh
 
 # Verbose logging
 PROTON_SYNC_DEBUG=true ./proton-sync-tui.sh
+
+# Number of transfers / folder listings to run at once (default 4).
+# Lower it if you hit Proton rate limits; raise it on a fast connection.
+PROTON_SYNC_JOBS=8 ./proton-sync-tui.sh
 ```
 
 ---
@@ -239,6 +244,7 @@ Set a non-interactive default via the menu or `PROTON_SYNC_CONFLICT`.
 - **First sync** establishes the baseline snapshot. Files existing on both sides are recorded without transfer; genuine differences are treated conservatively.
 - **Interactive conflicts require a terminal** — the gauge and conflict dialogs can't run fully unattended unless you set a `PROTON_SYNC_CONFLICT` strategy.
 - **Empty remote listing guard**: if the remote comes back empty (e.g., auth expired mid-run) but a snapshot exists, the sync aborts to avoid wiping local files.
+- **Remote listing failures**: each remote folder listing is retried 3 times. If one still fails, the sync stops before making any changes, since that folder's files would otherwise look deleted.
 
 ---
 

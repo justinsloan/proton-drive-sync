@@ -48,6 +48,10 @@ DEBUG="${PROTON_SYNC_DEBUG:-false}"
 FORCE_DRY_RUN="${PROTON_SYNC_DRY_RUN:-false}"
 DRY_RUN="$FORCE_DRY_RUN"
 
+# How many transfers / remote listings run at the same time.
+SYNC_JOBS="${PROTON_SYNC_JOBS:-4}"
+case "$SYNC_JOBS" in ''|*[!0-9]*|0) SYNC_JOBS=4 ;; esac
+
 # Conflict strategy: ask | local | remote | both | skip
 CONFLICT_STRATEGY="${PROTON_SYNC_CONFLICT:-ask}"
 
@@ -70,6 +74,12 @@ declare -a DEL_LOCAL_FOLDERS=()
 declare -a TRASH_REMOTE_FOLDERS=()
 
 declare -A NEW_LOCAL_FP=()
+
+# Queued file transfers (run in parallel by run_job_queue)
+declare -a JOB_QUEUE=()
+declare -A JOB_LFP=() JOB_RFP=() JOB_PREV_L=() JOB_PREV_R=()
+JOB_RESULTS="$STATE_DIR/job_results"
+ABORT_REASON=""
 declare -A NEW_REMOTE_FP=()
 
 # Conflict queue
@@ -242,53 +252,127 @@ fmt_fp() {
 # REMOTE LISTING
 # ============================================================
 
-list_remote_recursive() {
-    local remote_path="$1"
-    local prefix="$2"
+# list_remote_dir PREFIX
+# Print manifest lines for the direct children of $REMOTE_DIR/PREFIX:
+#   folder<SEP>rel<SEP><SEP>   and   file<SEP>rel<SEP>size<SEP>mtime
+# Returns 1 if the folder couldn't be listed after 3 attempts.
+list_remote_dir() {
+    local prefix="$1"
+    local remote_path="$REMOTE_DIR" json="" attempt ok=false
+    [ -n "$prefix" ] && remote_path="$REMOTE_DIR/$prefix"
 
-    proton-drive filesystem list "$remote_path" -j 2>>"$LOG_FILE" | \
-        jq -r '
-            .[] |
-            (if .type | type == "object" then .type.value else .type end) as $type |
-            (if .name | type == "object" then .name.value else .name end) as $name |
-            (if .mediaType | type == "object" then .mediaType.value else (.mediaType // "") end) as $media |
-            (.activeRevision.value.claimedSize // 0) as $size |
-            (.activeRevision.value.claimedModificationTime // "") as $mtime |
-            if ($name | test("\n")) then "skip\u001f\($name | gsub("\n"; "\\n"))"
-            else "\($type)\u001f\($name)\u001f\($media)\u001f\($size)\u001f\($mtime)" end
-        ' | \
-        while IFS="$SEP" read -r type name media size mtime; do
-            local rel_path
-            if [ -z "$prefix" ]; then
-                rel_path="$name"
-            else
-                rel_path="$prefix/$name"
-            fi
+    for attempt in 1 2 3; do
+        if json=$(proton-drive filesystem list "$remote_path" -j 2>>"$LOG_FILE"); then
+            ok=true
+            break
+        fi
+        log "[RETRY $attempt/3] Could not list $remote_path"
+        [ "$attempt" -lt 3 ] && sleep $((attempt * 2))
+    done
+    if [ "$ok" = false ]; then
+        log "[ERROR] Giving up listing $remote_path"
+        return 1
+    fi
 
-            if [ "$type" = "skip" ]; then
-                log "[SKIP] remote name contains a line break: $rel_path"
+    # Timestamps in the usual "YYYY-MM-DDTHH:MM:SS[.fff]Z" form are converted
+    # to epoch seconds here (prefixed "@"); anything else goes to `date -d`
+    # below, exactly as before, so existing snapshots stay valid.
+    printf '%s' "$json" | jq -r '
+        .[] |
+        (if .type | type == "object" then .type.value else .type end) as $type |
+        (if .name | type == "object" then .name.value else .name end) as $name |
+        (if .mediaType | type == "object" then .mediaType.value else (.mediaType // "") end) as $media |
+        (.activeRevision.value.claimedSize // 0) as $size |
+        (.activeRevision.value.claimedModificationTime // "") as $mtime |
+        (if ($mtime | type) == "string"
+            and ($mtime | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))
+         then "@" + ($mtime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | floor | tostring)
+         else $mtime end) as $mt |
+        if ($name | test("\n")) then "skip\u001f\($name | gsub("\n"; "\\n"))"
+        else "\($type)\u001f\($name)\u001f\($media)\u001f\($size)\u001f\($mt)" end
+    ' | \
+    while IFS="$SEP" read -r type name media size mtime; do
+        local rel_path
+        if [ -z "$prefix" ]; then
+            rel_path="$name"
+        else
+            rel_path="$prefix/$name"
+        fi
+
+        if [ "$type" = "skip" ]; then
+            log "[SKIP] remote name contains a line break: $rel_path"
+            continue
+        fi
+
+        if is_excluded "$rel_path"; then
+            continue
+        fi
+
+        if [ "$type" = "folder" ]; then
+            printf 'folder%s%s%s%s\n' "$SEP" "$rel_path" "$SEP" "$SEP"
+        else
+            if [ "$media" = "application/vnd.proton.doc" ]; then
+                log "[SKIP PROTON DOC] $rel_path"
                 continue
             fi
-
-            if is_excluded "$rel_path"; then
-                continue
+            local mtime_epoch=0
+            if [[ "$mtime" == @* ]]; then
+                mtime_epoch="${mtime#@}"
+            elif [ -n "$mtime" ]; then
+                mtime_epoch=$(date -d "$mtime" +%s 2>/dev/null || echo 0)
             fi
+            printf 'file%s%s%s%s%s%s\n' "$SEP" "$rel_path" "$SEP" "$size" "$SEP" "$mtime_epoch"
+        fi
+    done
+}
 
-            if [ "$type" = "folder" ]; then
-                printf 'folder%s%s%s%s\n' "$SEP" "$rel_path" "$SEP" "$SEP"
-                list_remote_recursive "$remote_path/$name" "$rel_path"
-            else
-                if [ "$media" = "application/vnd.proton.doc" ]; then
-                    log "[SKIP PROTON DOC] $rel_path"
-                    continue
-                fi
-                local mtime_epoch=0
-                if [ -n "$mtime" ]; then
-                    mtime_epoch=$(date -d "$mtime" +%s 2>/dev/null || echo 0)
-                fi
-                printf 'file%s%s%s%s%s%s\n' "$SEP" "$rel_path" "$SEP" "$size" "$SEP" "$mtime_epoch"
+# list_remote_dirs OUT_DIR PREFIX...
+# List several remote folders in parallel (up to $SYNC_JOBS at a time).
+# Folder i's lines go to OUT_DIR/i.out; a failed listing leaves OUT_DIR/i.failed.
+# Runs in a subshell so `wait` only sees these jobs.
+list_remote_dirs() {
+    local out_dir="$1"; shift
+    (
+        local i=0 running=0 prefix
+        for prefix in "$@"; do
+            if [ "$running" -ge "$SYNC_JOBS" ]; then
+                wait -n; running=$((running - 1))
             fi
+            { list_remote_dir "$prefix" > "$out_dir/$i.out" || : > "$out_dir/$i.failed"; } &
+            running=$((running + 1)); i=$((i + 1))
         done
+        wait
+    )
+}
+
+# Print the manifest for the whole remote tree, listing each level of
+# folders in parallel. Returns 1 if any folder couldn't be listed, since a
+# missing listing would make its files look deleted remotely.
+list_remote_tree() {
+    local tmp level_dir f type rel _rest n=0 failed=0
+    tmp=$(mktemp -d "$STATE_DIR/list.XXXXXX") || return 1
+    local -a level=("") next=()
+    while [ "${#level[@]}" -gt 0 ]; do
+        n=$((n + 1))
+        level_dir="$tmp/$n"
+        mkdir "$level_dir"
+        list_remote_dirs "$level_dir" "${level[@]}"
+        if compgen -G "$level_dir/*.failed" >/dev/null; then
+            failed=1
+            break
+        fi
+        next=()
+        for f in "$level_dir"/*.out; do
+            [ -f "$f" ] || continue
+            cat "$f"
+            while IFS="$SEP" read -r type rel _rest; do
+                [ "$type" = "folder" ] && next+=("$rel")
+            done < "$f"
+        done
+        level=("${next[@]+"${next[@]}"}")
+    done
+    rm -rf -- "${tmp:?}"
+    return "$failed"
 }
 
 fetch_remote_fingerprint() {
@@ -386,7 +470,7 @@ load_snapshot() {
 }
 
 load_manifests_to_memory() {
-    while IFS="$SEP" read -r type rel; do
+    while IFS="$SEP" read -r type rel _size _mtime; do
         LOCAL_ITEMS["${type}|${rel}"]=1
     done < "$LOCAL_MANIFEST"
     while IFS="$SEP" read -r type rel size mtime; do
@@ -619,13 +703,13 @@ resolve_keep_both() {
         if ! retry proton-drive filesystem download "$remote_path" "$tmp" \
             || [ ! -f "$tmp/$name" ] \
             || ! mv "$tmp/$name" "$LOCAL_DIR/$copy_rel"; then
-            rm -rf "$tmp"
+            rm -rf -- "${tmp:?}"
             log "[ERROR] Could not save remote copy of $rel; leaving conflict unresolved"
             COUNT_ERRORS=$((COUNT_ERRORS + 1))
             snap_file "$rel" "${CONFLICT_PREV_L[$rel]}" "${CONFLICT_PREV_R[$rel]}"
             return
         fi
-        rm -rf "$tmp"
+        rm -rf -- "${tmp:?}"
         COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
     fi
 
@@ -719,6 +803,142 @@ resolve_all_conflicts() {
 }
 
 # ============================================================
+# PARALLEL FILE TRANSFERS
+# ============================================================
+
+# queue_job KIND REL LOCAL_FP REMOTE_FP PREV_LOCAL_FP PREV_REMOTE_FP
+# KIND: up_mod | down_mod | up_new | down_new | trash
+queue_job() {
+    JOB_QUEUE+=("$1${SEP}$2")
+    JOB_LFP["$2"]="$3"; JOB_RFP["$2"]="$4"
+    JOB_PREV_L["$2"]="$5"; JOB_PREV_R["$2"]="$6"
+}
+
+# Runs in a background job: do the network operation, report ok/fail.
+run_one_job() {
+    local kind="$1" rel="$2" rc=0
+    local local_path="$LOCAL_DIR/$rel" remote_path="$REMOTE_DIR/$rel"
+    case "$kind" in
+        up_mod)   run_retry proton-drive filesystem upload -f replace "$local_path" "$(dirname "$remote_path")" || rc=1 ;;
+        up_new)   run_retry proton-drive filesystem upload "$local_path" "$(dirname "$remote_path")" || rc=1 ;;
+        down_mod) run_retry proton-drive filesystem download -f replace "$remote_path" "$(dirname "$local_path")" || rc=1 ;;
+        down_new) run_retry proton-drive filesystem download "$remote_path" "$(dirname "$local_path")" || rc=1 ;;
+        trash)    run_retry proton-drive filesystem trash "$remote_path" || rc=1 ;;
+    esac
+    local status=ok
+    [ "$rc" -ne 0 ] && status=fail
+    # One short line per append, so concurrent writes don't interleave.
+    printf '%s\n' "${kind}${SEP}${rel}${SEP}${status}" >> "$JOB_RESULTS"
+}
+
+# Run JOB_QUEUE with up to $SYNC_JOBS jobs at a time. The pool runs in a
+# subshell so `wait` only sees these jobs (not the progress dialog).
+run_job_queue() {
+    : > "$JOB_RESULTS"
+    [ "${#JOB_QUEUE[@]}" -eq 0 ] && return 0
+    (
+        local spec kind rel running=0
+        for spec in "${JOB_QUEUE[@]}"; do
+            kind="${spec%%"$SEP"*}"; rel="${spec#*"$SEP"}"
+            if [ "$running" -ge "$SYNC_JOBS" ]; then
+                wait -n; running=$((running - 1))
+            fi
+            case "$kind" in
+                up_*)   gauge_update "Upload: $rel" ;;
+                down_*) gauge_update "Download: $rel" ;;
+                trash)  gauge_update "Trash remote: $rel" ;;
+            esac
+            run_one_job "$kind" "$rel" &
+            running=$((running + 1))
+        done
+        wait
+    )
+    PROCESSED_ITEMS=$((PROCESSED_ITEMS + ${#JOB_QUEUE[@]}))
+}
+
+# Update counters and the snapshot from the job results. Uploaded files'
+# new remote fingerprints are read by listing each affected folder once,
+# instead of one `info` call per file.
+process_job_results() {
+    local kind rel status lfp
+    local -a refetch=()
+    [ -s "$JOB_RESULTS" ] || return 0
+
+    while IFS="$SEP" read -r kind rel status; do
+        local local_path="$LOCAL_DIR/$rel"
+        if [ "$status" != ok ]; then
+            COUNT_ERRORS=$((COUNT_ERRORS + 1))
+            case "$kind" in
+                up_mod|down_mod) snap_file "$rel" "${JOB_PREV_L[$rel]}" "${JOB_PREV_R[$rel]}" ;;
+            esac
+            continue
+        fi
+        case "$kind" in
+            up_mod|up_new)
+                COUNT_UPLOADED=$((COUNT_UPLOADED + 1))
+                if [ "$DRY_RUN" = true ]; then
+                    [ "$kind" = up_mod ] && snap_file "$rel" "${JOB_LFP[$rel]}" "${JOB_RFP[$rel]}"
+                else
+                    refetch+=("$kind${SEP}$rel")
+                fi
+                ;;
+            down_mod)
+                COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
+                lfp="${JOB_LFP[$rel]}"
+                [ "$DRY_RUN" = false ] && lfp=$(get_local_fingerprint "$local_path")
+                snap_file "$rel" "$lfp" "${JOB_RFP[$rel]}"
+                ;;
+            down_new)
+                if [ -f "$local_path" ]; then
+                    COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
+                    snap_file "$rel" "$(get_local_fingerprint "$local_path")" "${JOB_RFP[$rel]}"
+                elif [ "$DRY_RUN" = false ]; then
+                    COUNT_ERRORS=$((COUNT_ERRORS + 1))
+                fi
+                ;;
+            trash)
+                COUNT_TRASHED_REMOTE=$((COUNT_TRASHED_REMOTE + 1))
+                ;;
+        esac
+    done < "$JOB_RESULTS"
+    rm -f "$JOB_RESULTS"
+
+    [ "${#refetch[@]}" -eq 0 ] && return 0
+
+    # List each parent folder of an uploaded file once, in parallel.
+    local -A dir_seen=() remote_fp=()
+    local -a dirs=()
+    local spec dir tmp f type size mtime
+    for spec in "${refetch[@]}"; do
+        rel="${spec#*"$SEP"}"
+        dir=$(dirname "$rel"); [ "$dir" = "." ] && dir=""
+        if [ -z "${dir_seen[x$dir]+x}" ]; then
+            dir_seen["x$dir"]=1
+            dirs+=("$dir")
+        fi
+    done
+    tmp=$(mktemp -d "$STATE_DIR/list.XXXXXX") || return 0
+    list_remote_dirs "$tmp" "${dirs[@]}"
+    for f in "$tmp"/*.out; do
+        [ -f "$f" ] || continue
+        while IFS="$SEP" read -r type rel size mtime; do
+            [ "$type" = "file" ] && remote_fp["$rel"]="${size}|${mtime}"
+        done < "$f"
+    done
+    rm -rf -- "${tmp:?}"
+
+    for spec in "${refetch[@]}"; do
+        kind="${spec%%"$SEP"*}"; rel="${spec#*"$SEP"}"
+        lfp=$(get_local_fingerprint "$LOCAL_DIR/$rel")
+        if [ "$kind" = up_mod ]; then
+            snap_file "$rel" "$lfp" "${remote_fp[$rel]:-}"
+        elif [ -n "${remote_fp[$rel]:-}" ]; then
+            snap_file "$rel" "$lfp" "${remote_fp[$rel]}"
+        fi
+    done
+}
+
+# ============================================================
 # PROGRESS GAUGE HELPER
 # ============================================================
 
@@ -751,6 +971,8 @@ sync_engine() {
     NEW_LOCAL_FP=(); NEW_REMOTE_FP=()
     CONFLICTS=(); CONFLICT_LOCAL_FP=(); CONFLICT_REMOTE_FP=()
     CONFLICT_PREV_L=(); CONFLICT_PREV_R=()
+    JOB_QUEUE=(); JOB_LFP=(); JOB_RFP=(); JOB_PREV_L=(); JOB_PREV_R=()
+    ABORT_REASON=""
     COUNT_OK=0; COUNT_UPLOADED=0; COUNT_DOWNLOADED=0
     COUNT_MOVED_REMOTE=0; COUNT_MOVED_LOCAL=0
     COUNT_DELETED_LOCAL=0; COUNT_TRASHED_REMOTE=0
@@ -761,28 +983,47 @@ sync_engine() {
     [ "$DRY_RUN" = true ] && log "=== DRY RUN MODE ==="
 
     gauge_update "Building local manifest..."
-    > "$LOCAL_MANIFEST"
-    find "$LOCAL_DIR" -mindepth 1 -print0 | sort -z | \
-        while IFS= read -r -d '' path; do
-            rel="${path#"$LOCAL_DIR"/}"
+    # One find pass collects type, size and mtime for every local item
+    # (instead of a stat per file) and skips excluded names without
+    # descending into them. Records are "path<TAB>type size mtime".
+    local -a prune=()
+    local pattern
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        prune+=(-name "$pattern" -o)
+    done
+    unset 'prune[${#prune[@]}-1]'
+    local rec meta ftype fsize fmtime
+    find "$LOCAL_DIR" -mindepth 1 \( "${prune[@]}" \) -prune -o \
+        -printf '%P\t%Y %s %T@\0' | sort -z | \
+        while IFS= read -r -d '' rec; do
+            rel="${rec%$'\t'*}"
+            meta="${rec##*$'\t'}"
             if [[ "$rel" == *$'\n'* ]]; then
                 log "[SKIP] local name contains a line break: ${rel//$'\n'/\\n}"
                 continue
             fi
-            is_excluded "$rel" && continue
-            if [ -d "$path" ]; then
-                printf 'folder%s%s\n' "$SEP" "$rel" >> "$LOCAL_MANIFEST"
-            else
-                printf 'file%s%s\n' "$SEP" "$rel" >> "$LOCAL_MANIFEST"
-            fi
-        done
+            ftype="${meta%% *}"; meta="${meta#* }"
+            fsize="${meta%% *}"; fmtime="${meta#* }"; fmtime="${fmtime%.*}"
+            case "$ftype" in
+                d) printf 'folder%s%s\n' "$SEP" "$rel" ;;
+                f) printf 'file%s%s%s%s%s%s\n' "$SEP" "$rel" "$SEP" "$fsize" "$SEP" "$fmtime" ;;
+            esac
+        done > "$LOCAL_MANIFEST"
 
     gauge_update "Building remote manifest..."
-    > "$REMOTE_MANIFEST"
-    list_remote_recursive "$REMOTE_DIR" "" | sort > "$REMOTE_MANIFEST"
+    if ! list_remote_tree > "$REMOTE_MANIFEST.unsorted"; then
+        rm -f "$REMOTE_MANIFEST.unsorted"
+        ABORT_REASON="Could not list one or more remote folders (see log). Stopped so their files aren't treated as deleted."
+        log "[FATAL] $ABORT_REASON"
+        echo "XXX"; echo "100"; echo "ABORTED: remote listing failed (see log)"; echo "XXX"
+        return 1
+    fi
+    sort "$REMOTE_MANIFEST.unsorted" > "$REMOTE_MANIFEST"
+    rm -f "$REMOTE_MANIFEST.unsorted"
 
     if ! check_remote_manifest_sane; then
-        log "[FATAL] Remote listing empty but sync history exists. Aborting."
+        ABORT_REASON="Remote listing came back empty but sync history exists. If the remote really is empty, remove $SNAPSHOT to reset."
+        log "[FATAL] $ABORT_REASON"
         echo "XXX"; echo "100"; echo "ABORTED: unsafe remote state (see log)"; echo "XXX"
         return 1
     fi
@@ -794,7 +1035,7 @@ sync_engine() {
     TOTAL_ITEMS=$(( $(wc -l < "$LOCAL_MANIFEST") + $(wc -l < "$REMOTE_MANIFEST") + 2 ))
 
     # ---------- PHASE 2: local items ----------
-    while IFS="$SEP" read -r type rel; do
+    while IFS="$SEP" read -r type rel lsize lmtime; do
         gauge_update "Local: $rel"
         remote_path="$REMOTE_DIR/$rel"
         local_path="$LOCAL_DIR/$rel"
@@ -812,7 +1053,7 @@ sync_engine() {
 
         elif [ "$type" = "file" ]; then
             [ -f "$local_path" ] || continue
-            local local_fp; local_fp=$(get_local_fingerprint "$local_path")
+            local local_fp="${lsize}|${lmtime}"
             local prev_local_fp="${SNAPSHOT_LOCAL_FP[$rel]:-}"
             local prev_remote_fp="${SNAPSHOT_REMOTE_FP[$rel]:-}"
 
@@ -832,28 +1073,10 @@ sync_engine() {
                     snap_file "${rel}" "${local_fp}" "${remote_fp}"
                 elif [ "$local_changed" = true ] && [ "$remote_changed" = false ]; then
                     log "[UPLOAD MODIFIED] $rel"
-                    if run_retry proton-drive filesystem upload -f replace "$local_path" "$(dirname "$remote_path")"; then
-                        COUNT_UPLOADED=$((COUNT_UPLOADED + 1))
-                        if [ "$DRY_RUN" = false ]; then
-                            remote_fp=$(fetch_remote_fingerprint "$remote_path")
-                            local_fp=$(get_local_fingerprint "$local_path")
-                        fi
-                        snap_file "${rel}" "${local_fp}" "${remote_fp}"
-                    else
-                        COUNT_ERRORS=$((COUNT_ERRORS + 1))
-                        snap_file "${rel}" "${prev_local_fp}" "${prev_remote_fp}"
-                    fi
+                    queue_job up_mod "$rel" "$local_fp" "$remote_fp" "$prev_local_fp" "$prev_remote_fp"
                 elif [ "$local_changed" = false ] && [ "$remote_changed" = true ]; then
                     log "[DOWNLOAD MODIFIED] $rel"
-                    ensure_local_folders "$(dirname "$local_path")"
-                    if run_retry proton-drive filesystem download -f replace "$remote_path" "$(dirname "$local_path")"; then
-                        COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
-                        [ "$DRY_RUN" = false ] && local_fp=$(get_local_fingerprint "$local_path")
-                        snap_file "${rel}" "${local_fp}" "${remote_fp}"
-                    else
-                        COUNT_ERRORS=$((COUNT_ERRORS + 1))
-                        snap_file "${rel}" "${prev_local_fp}" "${prev_remote_fp}"
-                    fi
+                    queue_job down_mod "$rel" "$local_fp" "$remote_fp" "$prev_local_fp" "$prev_remote_fp"
                 else
                     log "[CONFLICT] $rel"
                     COUNT_CONFLICTS=$((COUNT_CONFLICTS + 1))
@@ -978,40 +1201,31 @@ sync_engine() {
     # ---------- PHASE 5: remaining actions ----------
     for rel in "${REMAINING_NEW_LOCAL[@]+"${REMAINING_NEW_LOCAL[@]}"}"; do
         [ -z "$rel" ] && continue
-        gauge_update "Upload: $rel"
-        local_path="$LOCAL_DIR/$rel"; remote_path="$REMOTE_DIR/$rel"
-        [ -f "$local_path" ] || continue
+        [ -f "$LOCAL_DIR/$rel" ] || continue
         log "[UPLOAD NEW] $rel"
+        # Folder creation updates KNOWN_DIRS, so it stays serial.
         ensure_remote_folders "$(dirname "$rel")"
-        if run_retry proton-drive filesystem upload "$local_path" "$(dirname "$remote_path")"; then
-            COUNT_UPLOADED=$((COUNT_UPLOADED + 1))
-            local lfp rfp=""
-            lfp=$(get_local_fingerprint "$local_path")
-            [ "$DRY_RUN" = false ] && rfp=$(fetch_remote_fingerprint "$remote_path")
-            [ -n "$rfp" ] && snap_file "${rel}" "${lfp}" "${rfp}"
-        else
-            COUNT_ERRORS=$((COUNT_ERRORS + 1))
-        fi
+        queue_job up_new "$rel" "${NEW_LOCAL_FP[$rel]}" "" "" ""
     done
 
     for rel in "${REMAINING_NEW_REMOTE[@]+"${REMAINING_NEW_REMOTE[@]}"}"; do
         [ -z "$rel" ] && continue
-        gauge_update "Download: $rel"
-        local_path="$LOCAL_DIR/$rel"; remote_path="$REMOTE_DIR/$rel"
         log "[DOWNLOAD NEW] $rel"
-        ensure_local_folders "$(dirname "$local_path")"
-        if run_retry proton-drive filesystem download "$remote_path" "$(dirname "$local_path")"; then
-            if [ -f "$local_path" ]; then
-                COUNT_DOWNLOADED=$((COUNT_DOWNLOADED + 1))
-                local lfp; lfp=$(get_local_fingerprint "$local_path")
-                snap_file "${rel}" "${lfp}" "${NEW_REMOTE_FP[$rel]}"
-            elif [ "$DRY_RUN" = false ]; then
-                COUNT_ERRORS=$((COUNT_ERRORS + 1))
-            fi
-        else
-            COUNT_ERRORS=$((COUNT_ERRORS + 1))
-        fi
+        ensure_local_folders "$(dirname "$LOCAL_DIR/$rel")"
+        queue_job down_new "$rel" "" "${NEW_REMOTE_FP[$rel]}" "" ""
     done
+
+    for rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
+        [ -n "${MOVED_FROM[$rel]+x}" ] && continue
+        [ -f "$LOCAL_DIR/$rel" ] && continue
+        log "[DELETED LOCALLY] $rel -> trashing remote"
+        queue_job trash "$rel" "" "" "" ""
+    done
+
+    # Run every queued file transfer (modified and new files, remote
+    # trashes) in parallel, then record the results.
+    run_job_queue
+    process_job_results
 
     for rel in "${DELETED_REMOTELY_FILES[@]+"${DELETED_REMOTELY_FILES[@]}"}"; do
         [ -n "${MOVED_FROM[$rel]+x}" ] && continue
@@ -1020,18 +1234,6 @@ sync_engine() {
         log "[DELETED REMOTELY] $rel -> removing local"
         trash_local "$local_path" "$rel"
         COUNT_DELETED_LOCAL=$((COUNT_DELETED_LOCAL + 1))
-    done
-
-    for rel in "${TRASH_REMOTE_FILES[@]+"${TRASH_REMOTE_FILES[@]}"}"; do
-        [ -n "${MOVED_FROM[$rel]+x}" ] && continue
-        [ -f "$LOCAL_DIR/$rel" ] && continue
-        gauge_update "Trash remote: $rel"
-        log "[DELETED LOCALLY] $rel -> trashing remote"
-        if run_retry proton-drive filesystem trash "$REMOTE_DIR/$rel"; then
-            COUNT_TRASHED_REMOTE=$((COUNT_TRASHED_REMOTE + 1))
-        else
-            COUNT_ERRORS=$((COUNT_ERRORS + 1))
-        fi
     done
 
     for rel in "${DEL_LOCAL_FOLDERS[@]+"${DEL_LOCAL_FOLDERS[@]}"}"; do
@@ -1192,11 +1394,9 @@ run_sync_with_gauge() {
         rm -f "$conflict_dump" "$NEW_SNAPSHOT" "$LOCAL_MANIFEST" "$REMOTE_MANIFEST"
         release_lock
         "$DIALOG" --backtitle "$DIALOG_BACKTITLE" --title "Sync Aborted" --msgbox \
-"Remote listing came back empty but sync history exists.
-Refusing to proceed; the snapshot was left unchanged.
+"$ABORT_REASON
 
-If the remote really is empty, remove:
-  $SNAPSHOT
+No changes were made and the snapshot was left unchanged.
 
 Log: $LOG_FILE" 14 "$DIALOG_WIDTH"
         return
@@ -1446,9 +1646,8 @@ headless_sync() {
     # Run in the current shell (not a pipeline) so the counters survive.
     if ! sync_engine "$conflict_dump" >/dev/null; then
         rm -f "$conflict_dump" "$NEW_SNAPSHOT" "$LOCAL_MANIFEST" "$REMOTE_MANIFEST"
-        echo "ERROR: Remote listing came back empty but sync history exists." >&2
-        echo "Refusing to proceed. If the remote really is empty, reset with:" >&2
-        echo "  rm '$SNAPSHOT'" >&2
+        echo "ERROR: $ABORT_REASON" >&2
+        echo "No changes were made." >&2
         echo "Log: $LOG_FILE" >&2
         return 1
     fi
