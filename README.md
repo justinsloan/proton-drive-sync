@@ -121,11 +121,41 @@ Run a single sync without the menu, then exit. This mode doesn't need `dialog` a
 
 The script also switches to headless mode automatically when there is no terminal (cron, systemd, pipes). It prints a summary and exits `1` if the sync hit errors, wasn't logged in, or another sync held the lock. Conflicts are left unresolved unless `PROTON_SYNC_CONFLICT` is set, because nobody is there to ask. Log in once interactively (`proton-drive auth login`) before scheduling it.
 
-Example crontab entry (hourly):
+### Scheduling with cron
 
-```cron
-0 * * * * PROTON_SYNC_CONFLICT=both /path/to/proton-sync-tui.sh --headless
-```
+1. Log in once by hand, and do a first sync to check that everything works:
+
+   ```bash
+   proton-drive auth login
+   ./proton-sync-tui.sh --headless
+   ```
+
+2. Find where `proton-drive` is installed. cron only searches `/usr/bin:/bin`, so you'll add this folder to its `PATH`:
+
+   ```bash
+   which proton-drive
+   ```
+
+3. Open your crontab with `crontab -e` and add an entry. This one syncs every hour at 17 minutes past:
+
+   ```cron
+   PATH=/usr/local/bin:/usr/bin:/bin:/home/YOU/.local/bin
+   PROTON_SYNC_CONFLICT=both
+
+   17 * * * * /bin/bash /home/YOU/proton-drive-sync/proton-sync-tui.sh --headless >> /home/YOU/.local/share/proton-sync/cron.log 2>&1
+   ```
+
+   Replace `YOU` with your username, and put the folder from step 2 in `PATH`. Use full paths throughout, since cron doesn't expand `~`.
+
+4. After the first scheduled run, check `~/.local/share/proton-sync/cron.log` for the summary or any error.
+
+Notes:
+
+- **Conflicts:** set `PROTON_SYNC_CONFLICT` in the crontab. Without it, conflicting files are skipped on every run. `both` is the safest choice: it keeps the local file and saves the remote copy beside it with `.remote` in the name.
+- **`XDG_DATA_HOME`:** if your shell sets it, set it in the crontab too. Otherwise cron keeps a separate sync history under `~/.local/share/proton-sync`, and its first run treats every file as new.
+- **"Not logged in" only under cron:** if a manual run works but cron reports `Cannot access ... are you logged in?`, `proton-drive` probably can't reach its stored login outside your desktop session.
+- **Stale lock:** if a sync is killed outright (for example, by a power loss), the lock stays behind and every later run exits with "Another sync is already running". Delete `~/.local/share/proton-sync/sync.lock` to clear it.
+- **Old logs:** each run writes a new file to `~/.local/share/proton-sync/logs/`. They aren't deleted automatically, so clear out old ones now and then.
 
 ### Environment Variables
 
