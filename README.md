@@ -1,6 +1,6 @@
 # Proton Drive Sync (TUI)
 
-A two-way file synchronization tool for [Proton Drive](https://proton.me/drive), built as a Bash script with a terminal user interface (`dialog`, or `whiptail` as a fallback). It syncs a local folder with a Proton Drive folder, detecting changes, deletions, moves, and conflicts, and can run unattended from cron.
+A file synchronization tool for [Proton Drive](https://proton.me/drive) on Linux, built as a Bash script with a terminal user interface (`dialog`, or `whiptail` as a fallback). It keeps one or more local folders in sync with Proton Drive folders (two-way, backup-only or download-only), detecting changes, deletions, moves and conflicts. It can run on a schedule or continuously in the background.
 
 ![Bash](https://img.shields.io/badge/language-Bash-4EAA25?logo=gnu-bash&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue)
@@ -14,7 +14,7 @@ A two-way file synchronization tool for [Proton Drive](https://proton.me/drive),
 - 🔄 **True two-way sync** — changes propagate in both directions
 - 🧠 **Three-way change detection** — uses a snapshot of the last sync to distinguish local vs. remote changes
 - 🗂️ **Recursive directory support** — handles arbitrarily nested folders, creating them on either side as needed
-- 🚚 **Move/rename detection** — reorganized files are moved/renamed remotely instead of re-uploaded
+- 🚚 **Move/rename detection** — files moved or renamed on one side are moved on the other instead of being transferred again
 - 👀 **Preview** — see exactly which files would be uploaded, downloaded, moved or deleted, then run that sync with one keypress
 - ⚔️ **Conflict resolution** — keep local, keep Proton, keep both, or skip, with a line-by-line diff for text files
 - 🛑 **Large-deletion safety** — asks before deleting more than 50 files or 25% of your files (both adjustable); automatic syncs stop instead
@@ -74,6 +74,16 @@ proton-drive-sync --uninstall       # removes the copy and launcher; keeps setti
 ```
 
 If automatic sync is on, `--install` points it at the installed copy.
+
+---
+
+## Quick Start
+
+1. Log in to Proton Drive: `proton-drive auth login`
+2. Start the menu: `./proton-sync-tui.sh`
+3. Check the folders at the top of the menu. To change them, or add more, open **Folder pairs**.
+4. Choose **Preview sync** to see what the first sync will do, then **Run sync now**.
+5. Optionally turn on **Automatic sync** (for example, every hour or continuously).
 
 ---
 
@@ -267,6 +277,8 @@ The script maintains a **snapshot** of the last known state of every file (size 
 | A | — | A | 🗑️ Trash remote (deleted locally) |
 | A | A | — | 🗑️ Delete local (deleted remotely) |
 
+This is for two-way folder pairs. Backup-only and download-only pairs never delete, and resolve conflicts in one direction; see [Folder pairs and sync modes](#folder-pairs-and-sync-modes).
+
 ---
 
 ## State & Data Locations
@@ -309,12 +321,14 @@ Choose a default in Settings → Conflicts, or with `PROTON_SYNC_CONFLICT`.
 
 ## Limitations & Notes
 
-- **Proton Docs** (`application/vnd.proton.doc`) are skipped — they're a proprietary format that can't be downloaded as regular files.
+- **Proton Docs** (`application/vnd.proton.doc`) aren't synced, because they can't be downloaded as regular files. They're listed under **Not synced** in the preview, and a local file with the same name isn't uploaded over them.
 - **Change detection uses size + modification time**, not content hashes. This is fast and reliable for typical use, but two different edits producing the same size and mtime won't be distinguished.
 - **Move detection matches on fingerprint** (size + mtime). A move is only recognized when its fingerprint is unique; files with identical fingerprints fall back to upload/download plus delete. This is safe, just less efficient.
 - **Filenames containing a line break** are skipped and noted in the log. All other characters, including `|` and leading or trailing spaces, are supported.
 - **First sync** establishes the baseline snapshot. Files existing on both sides are recorded without transfer; files on only one side are copied to the other; nothing is deleted.
 - **Empty remote listing guard**: if the remote comes back empty (e.g., auth expired mid-run) but a snapshot exists, the sync aborts to avoid wiping local files.
+- **Continuous sync** reacts to local changes within seconds, but notices changes made on Proton Drive (for example, from another computer) only at its regular check (every 15 minutes by default).
+- **Bandwidth limits, file version history and checksum comparison** aren't supported, because they depend on options in the `proton-drive` CLI.
 - **Remote listing failures**: each remote folder listing is retried 3 times. If one still fails, the sync stops before making any changes, since that folder's files would otherwise look deleted.
 
 ---
@@ -325,7 +339,7 @@ Choose a default in Settings → Conflicts, or with `PROTON_SYNC_CONFLICT`.
 Another sync really is running (for example, automatic sync), so wait for it to finish. A lock left by a sync that crashed is removed automatically. `--status` shows whether a sync is running.
 
 **Everything shows as re-downloading**
-Your snapshot may be out of date or missing. Check the log in **Sync history**, or reset the baseline for the current folders (⚠️ treats current state as truth). Settings → *Where settings, logs and trash are stored* shows the folder that holds the `snapshot` file.
+Your snapshot may be out of date or missing. Check the log in **Sync history**. To start over for the current folders, delete the `snapshot` file in the folder shown under Settings → *Where settings, logs and trash are stored*. The next sync then behaves like a first sync: it copies files that exist on only one side and deletes nothing.
 
 **Files keep re-uploading**
 Something is changing the local modification time between runs (e.g., an editor, backup tool, or filesystem quirk). Enable debug logging in Settings to inspect fingerprints.
@@ -348,9 +362,10 @@ Use **Restore deleted files** in the main menu. Files deleted on Proton Drive ar
 
 Issues and pull requests are welcome. Please:
 
-1. Test changes with **dry-run mode** and non-critical data.
-2. Keep the script POSIX-friendly where practical (Bash 4+ is assumed).
-3. Describe the scenario your change addresses.
+1. Test changes with **Preview sync** / `--dry-run` and non-critical data.
+2. Keep the script working with Bash 4.4 and with both `dialog` and `whiptail`.
+3. Run `shellcheck proton-sync-tui.sh` before submitting.
+4. Describe the scenario your change addresses.
 
 ---
 
